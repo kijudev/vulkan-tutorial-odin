@@ -26,6 +26,20 @@
             libxinerama
             libxext
           ];
+
+          vulkanSdk = pkgs.symlinkJoin {
+            name = "vulkan-sdk";
+            paths = with pkgs; [
+              vulkan-headers
+              vulkan-loader
+              vulkan-validation-layers
+              vulkan-tools
+              vulkan-tools-lunarg
+              shader-slang
+              shaderc
+              spirv-tools
+            ];
+          };
         in
         {
           default = pkgs.mkShell {
@@ -49,6 +63,7 @@
 
             LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath runtimeLibs;
+            VULKAN_SDK = vulkanSdk;
             VK_LAYER_PATH = "${pkgs.vulkan-validation-layers}/share/vulkan/explicit_layer.d";
           };
         }
