@@ -2,15 +2,16 @@ package main
 
 import "base:runtime"
 import "core:fmt"
+import "core:os"
 import "core:reflect"
 import "vendor:glfw"
 import vk "vendor:vulkan"
 
-vk_debug_messenger: vk.DebugUtilsMessengerEXT = {}
-vk_debug_level: vk.DebugUtilsMessageSeverityFlagsEXT = {.WARNING, .ERROR}
-vk_validation_layers := []cstring{"VK_LAYER_KHRONOS_validation"}
+VK_Debug_Messenger: vk.DebugUtilsMessengerEXT = {}
+VK_Debug_Level: vk.DebugUtilsMessageSeverityFlagsEXT = {.WARNING, .ERROR}
+VK_Validation_Layers := []cstring{"VK_LAYER_KHRONOS_validation"}
 
-vk_must_result :: proc(result: vk.Result, op: string, loc := #caller_location) {
+check_vk_result :: proc(result: vk.Result, op: string, loc := #caller_location) {
 	if result == .SUCCESS do return
 	fail := context.assertion_failure_proc
 
@@ -21,17 +22,26 @@ vk_must_result :: proc(result: vk.Result, op: string, loc := #caller_location) {
 	}
 }
 
-vk_must_b32 :: proc(result: b32, op: string, loc := #caller_location) {
+check_b32 :: proc(result: b32, op: string, loc := #caller_location) {
 	if result do return
 	context.assertion_failure_proc(op, "false", loc)
 }
 
-vk_must :: proc {
-	vk_must_result,
-	vk_must_b32,
+check :: proc {
+	check_vk_result,
+	check_b32,
 }
 
-vk_check_layer_support :: proc(required_layers: []cstring) -> b32 {
+init_glfw :: proc() {
+	if !glfw.Init() {
+		fmt.eprintln("GLFW: failed to initialize")
+		os.exit(1)
+	} else {
+		fmt.println("GLFW: initialized")
+	}
+}
+
+check_layer_support :: proc(required_layers: []cstring) -> b32 {
 	layer_count: u32
 	vk.EnumerateInstanceLayerProperties(&layer_count, nil)
 
@@ -55,7 +65,7 @@ vk_check_layer_support :: proc(required_layers: []cstring) -> b32 {
 	return true
 }
 
-vk_debug_callback :: proc "system" (
+debug_callback :: proc "system" (
 	messageSeverity: vk.DebugUtilsMessageSeverityFlagsEXT,
 	messageTypes: vk.DebugUtilsMessageTypeFlagsEXT,
 	pCallbackData: ^vk.DebugUtilsMessengerCallbackDataEXT,
@@ -65,30 +75,23 @@ vk_debug_callback :: proc "system" (
 
 	if pCallbackData.pMessageIdName == "Loader Message" && .ERROR not_in messageSeverity do return false
 
-	if .ERROR in messageSeverity && .ERROR in vk_debug_level {
+	if .ERROR in messageSeverity && .ERROR in VK_Debug_Level {
 		fmt.eprintfln("[validation ERROR] %s", pCallbackData.pMessage)
-	} else if .WARNING in messageSeverity && .WARNING in vk_debug_level {
+	} else if .WARNING in messageSeverity && .WARNING in VK_Debug_Level {
 		fmt.eprintfln("[validation WARNING] %s", pCallbackData.pMessage)
-	} else if .INFO in messageSeverity && .INFO in vk_debug_level {
+	} else if .INFO in messageSeverity && .INFO in VK_Debug_Level {
 		fmt.println("[validation INFO]", pCallbackData.pMessage)
-	} else if .VERBOSE in messageSeverity && .VERBOSE in vk_debug_level {
+	} else if .VERBOSE in messageSeverity && .VERBOSE in VK_Debug_Level {
 		fmt.printfln("[validation VERBOSE] %s", pCallbackData.pMessage)
 	}
 
 	return false
 }
 
-glfw_must_init :: proc() {
-	if !glfw.Init() {
-		fmt.eprintln("GLFW: failed to initialize")
-	} else {
-		fmt.println("GLFW: initialized")
-	}
-}
 
-vk_must_create_instance :: proc() -> vk.Instance {
+create_instance :: proc() -> vk.Instance {
 	vk.load_proc_addresses(rawptr(glfw.GetInstanceProcAddress))
-	vk_must(vk_check_layer_support(vk_validation_layers), "validation layers not available")
+	check(check_layer_support(VK_Validation_Layers), "validation layers not available")
 
 	application_i := vk.ApplicationInfo {
 		sType              = .APPLICATION_INFO,
@@ -108,9 +111,9 @@ vk_must_create_instance :: proc() -> vk.Instance {
 
 	debug_ci := vk.DebugUtilsMessengerCreateInfoEXT {
 		sType           = .DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-		messageSeverity = vk_debug_level,
+		messageSeverity = VK_Debug_Level,
 		messageType     = {.GENERAL, .VALIDATION, .PERFORMANCE},
-		pfnUserCallback = vk_debug_callback,
+		pfnUserCallback = debug_callback,
 		pUserData       = nil,
 	}
 
@@ -119,20 +122,20 @@ vk_must_create_instance :: proc() -> vk.Instance {
 		pApplicationInfo        = &application_i,
 		enabledExtensionCount   = u32(len(extension_names)),
 		ppEnabledExtensionNames = raw_data(extension_names[:]),
-		enabledLayerCount       = u32(len(vk_validation_layers)),
-		ppEnabledLayerNames     = raw_data(vk_validation_layers),
+		enabledLayerCount       = u32(len(VK_Validation_Layers)),
+		ppEnabledLayerNames     = raw_data(VK_Validation_Layers),
 		pNext                   = &debug_ci,
 	}
 
 	instance: vk.Instance
-	vk_must(vk.CreateInstance(&instance_ci, nil, &instance), "failed to create instance")
+	check(vk.CreateInstance(&instance_ci, nil, &instance), "failed to create instance")
 	fmt.println("VK: instance created")
 
 	vk.load_proc_addresses_instance(instance)
 
 	if vk.CreateDebugUtilsMessengerEXT != nil {
-		vk_must(
-			vk.CreateDebugUtilsMessengerEXT(instance, &debug_ci, nil, &vk_debug_messenger),
+		check(
+			vk.CreateDebugUtilsMessengerEXT(instance, &debug_ci, nil, &VK_Debug_Messenger),
 			"failed to create debug messenger",
 		)
 	}
@@ -143,11 +146,11 @@ vk_must_create_instance :: proc() -> vk.Instance {
 main :: proc() {
 	fmt.println("---- Vulkan Tutorial Odin ----")
 
-	glfw_must_init()
-	instance := vk_must_create_instance()
+	init_glfw()
+	instance := create_instance()
 
 	if instance != nil && vk.DestroyDebugUtilsMessengerEXT != nil {
-		vk.DestroyDebugUtilsMessengerEXT(instance, vk_debug_messenger, nil)
+		vk.DestroyDebugUtilsMessengerEXT(instance, VK_Debug_Messenger, nil)
 	}
 
 	if instance != nil {
