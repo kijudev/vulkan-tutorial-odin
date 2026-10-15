@@ -7,6 +7,8 @@ import "core:reflect"
 import "vendor:glfw"
 import vk "vendor:vulkan"
 
+// ------------------------------------------------------------------- CONSTANTS
+
 VK_Debug_Messenger: vk.DebugUtilsMessengerEXT = {}
 VK_Debug_Level: vk.DebugUtilsMessageSeverityFlagsEXT = {.WARNING, .ERROR}
 VK_Validation_Layers := []cstring{"VK_LAYER_KHRONOS_validation"}
@@ -21,6 +23,8 @@ check_vk_result :: proc(result: vk.Result, op: string, loc := #caller_location) 
 		fail(op, "VK: operation failed", loc)
 	}
 }
+
+// ---------------------------------------------------------------------- UTILS
 
 check_b32 :: proc(result: b32, op: string, loc := #caller_location) {
 	if result do return
@@ -40,6 +44,8 @@ init_glfw :: proc() {
 		fmt.println("GLFW: initialized")
 	}
 }
+
+// ---------------------------------------------------------------- VULKAN UTILS
 
 check_layer_support :: proc(required_layers: []cstring) -> b32 {
 	layer_count: u32
@@ -88,6 +94,153 @@ debug_callback :: proc "system" (
 	return false
 }
 
+get_queue_families :: proc(
+	physical_device: vk.PhysicalDevice,
+	queue_flags: vk.QueueFlags,
+) -> (
+	u32,
+	bool,
+) {
+	count: u32
+	vk.GetPhysicalDeviceQueueFamilyProperties(physical_device, &count, nil)
+
+	families := make([]vk.QueueFamilyProperties, count)
+	defer delete(families)
+
+	vk.GetPhysicalDeviceQueueFamilyProperties(physical_device, &count, raw_data(families))
+	for family, i in families {
+		if (queue_flags & family.queueFlags) == queue_flags {
+			return u32(i), true
+		}
+	}
+
+	return 0, false
+}
+
+Physcial_Device_Features :: struct {
+	default:                vk.PhysicalDeviceFeatures,
+	vulkan11:               vk.PhysicalDeviceVulkan11Features,
+	vulkan13:               vk.PhysicalDeviceVulkan13Features,
+	extended_dynamic_state: vk.PhysicalDeviceExtendedDynamicStateFeaturesEXT,
+}
+
+get_physical_device_features :: proc(
+	physical_device: vk.PhysicalDevice,
+) -> Physcial_Device_Features {
+	vulkan13 := vk.PhysicalDeviceVulkan13Features {
+		sType = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+	}
+
+	extended_dynamic_state := vk.PhysicalDeviceExtendedDynamicStateFeaturesEXT {
+		sType = .PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+	}
+
+	vulkan13.pNext = &extended_dynamic_state
+
+	vulkan11 := vk.PhysicalDeviceVulkan11Features {
+		sType = .PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+		pNext = &vulkan13,
+	}
+
+	features2 := vk.PhysicalDeviceFeatures2 {
+		sType = .PHYSICAL_DEVICE_FEATURES_2,
+		pNext = &vulkan11,
+	}
+
+	vk.GetPhysicalDeviceFeatures2(physical_device, &features2)
+	return Physcial_Device_Features {
+		default = features2.features,
+		vulkan11 = vulkan11,
+		vulkan13 = vulkan13,
+		extended_dynamic_state = extended_dynamic_state,
+	}
+}
+
+score_physical_device :: proc(physical_device: vk.PhysicalDevice) -> int {
+	properties: vk.PhysicalDeviceProperties
+	vk.GetPhysicalDeviceProperties(physical_device, &properties)
+
+	name := string(cstring(&properties.deviceName[0]))
+
+	if properties.apiVersion < vk.API_VERSION_1_4 {
+		fmt.printfln(
+			"  %q - apiVersion=%d.%d.%d, < 1.4 (skipped)",
+			name,
+			vk.API_VERSION_MAJOR(properties.apiVersion),
+			vk.API_VERSION_MINOR(properties.apiVersion),
+			vk.API_VERSION_PATCH(properties.apiVersion),
+		)
+
+		return -1
+	}
+
+	if _, ok := get_queue_families(physical_device, {.GRAPHICS}); !ok {
+		fmt.printfln("  %q - no graphics queue (skipped)", name)
+		return -1
+	}
+
+	required_extensions := []cstring{vk.KHR_SWAPCHAIN_EXTENSION_NAME}
+
+	{
+		extension_count: u32
+		vk.EnumerateDeviceExtensionProperties(physical_device, nil, &extension_count, nil)
+		available_extensions := make([]vk.ExtensionProperties, extension_count)
+		defer delete(available_extensions)
+		vk.EnumerateDeviceExtensionProperties(
+			physical_device,
+			nil,
+			&extension_count,
+			raw_data(available_extensions),
+		)
+
+		for extension in required_extensions {
+			found := false
+			for &ext in available_extensions {
+				if cstring(&ext.extensionName[0]) == extension {
+					found = true
+					break
+				}
+			}
+			if !found {
+				fmt.printfln("  %q - missing required extension %s (skipped)", name, extension)
+				return -1
+			}
+		}
+	}
+
+	features := get_physical_device_features(physical_device)
+
+	if !features.vulkan11.shaderDrawParameters {
+		fmt.printfln("  %q - missing shaderDrawParameters (skipped)", name)
+		return -1
+	}
+	if !features.vulkan13.dynamicRendering {
+		fmt.printfln("  %q - missing dynamicRendering (skipped)", name)
+		return -1
+	}
+	if !features.extended_dynamic_state.extendedDynamicState {
+		fmt.printfln("  %q - missing extendedDynamicState (skipped)", name)
+		return -1
+	}
+
+	score := 0
+
+	// Discrete GPU's have a significant performance advantage.
+	if properties.deviceType == .DISCRETE_GPU {
+		score += 1000
+	} else if properties.deviceType == .INTEGRATED_GPU {
+		score += 500
+	}
+
+	// Maximum possible size of textures affects graphics quality.
+	score += int(properties.limits.maxImageDimension2D)
+
+	fmt.printfln("  %q - type=%v, score=%d", name, properties.deviceType, score)
+	return score
+}
+
+
+// ---------------------------------------------------------------- VULKAN SETUP
 
 create_instance :: proc() -> vk.Instance {
 	vk.load_proc_addresses(rawptr(glfw.GetInstanceProcAddress))
@@ -143,11 +296,49 @@ create_instance :: proc() -> vk.Instance {
 	return instance
 }
 
+pick_physical_device :: proc(instance: vk.Instance) -> vk.PhysicalDevice {
+	device_count: u32
+	vk.EnumeratePhysicalDevices(instance, &device_count, nil)
+	if device_count == 0 {
+		fmt.eprintln("failed to find GPUs with Vulkan support!")
+		os.exit(1)
+	}
+
+	physical_devices := make([]vk.PhysicalDevice, device_count)
+	defer delete(physical_devices)
+
+	vk.EnumeratePhysicalDevices(instance, &device_count, raw_data(physical_devices))
+
+	best_score := -1
+	best_device: vk.PhysicalDevice = nil
+
+	for device in physical_devices {
+		score := score_physical_device(device)
+
+		if score > best_score {
+			best_score = score
+			best_device = device
+		}
+	}
+
+	if best_device == nil {
+		fmt.eprintln("failed to find a suitable GPU")
+		os.exit(1)
+	}
+
+	fmt.println("selected physical device")
+	return best_device
+}
+
+// ----------------------------------------------------------------- APPLICATION
+
 main :: proc() {
 	fmt.println("---- Vulkan Tutorial Odin ----")
 
 	init_glfw()
 	instance := create_instance()
+
+	_ = pick_physical_device(instance)
 
 	if instance != nil && vk.DestroyDebugUtilsMessengerEXT != nil {
 		vk.DestroyDebugUtilsMessengerEXT(instance, VK_Debug_Messenger, nil)
