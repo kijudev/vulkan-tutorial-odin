@@ -13,7 +13,7 @@ compile_slang_shader :: proc(slang_path: string, entry_points: []string) -> ([]b
 		return nil, false
 	}
 
-	slangc_executable := "clangc"
+	slangc_executable := "slangc"
 	slangc_path := fmt.tprintf("%s/bin/%s", vulkan_sdk_path, slangc_executable)
 
 	id := uuid.generate_v4()
@@ -68,7 +68,7 @@ compile_slang_shader :: proc(slang_path: string, entry_points: []string) -> ([]b
 		return nil, false
 	}
 
-	spv, read_err := os.read_entire_file_from_path(spv_path, context.temp_allocator)
+	spv, read_err := os.read_entire_file_from_path(spv_path, context.allocator)
 	if read_err != nil {
 		fmt.eprintfln(
 			"Failed to read compiled SPIR-V '%s': %s",
@@ -80,4 +80,22 @@ compile_slang_shader :: proc(slang_path: string, entry_points: []string) -> ([]b
 	}
 
 	return spv, true
+}
+
+main :: proc() {
+	fmt.println("Shaders compilation")
+	fmt.println("-------------------------------------------")
+
+	fmt.println()
+	fmt.println("Compiling...")
+
+	spv, ok := compile_slang_shader("./shader/shader.slang", {"vertMain", "fragMain"})
+
+	if !ok {
+		fmt.eprintln("Shader compilation failed.")
+		os.exit(1)
+	}
+
+	defer delete(spv)
+	fmt.printfln("Shaders compiled with success! SPIR-V size: %d bytes", len(spv))
 }
