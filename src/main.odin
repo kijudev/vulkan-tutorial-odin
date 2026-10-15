@@ -3,7 +3,6 @@ package main
 import "base:runtime"
 import "core:fmt"
 import "core:os"
-import "core:reflect"
 import "vendor:glfw"
 import vk "vendor:vulkan"
 
@@ -12,42 +11,12 @@ import vk "vendor:vulkan"
 VK_Debug_Messenger: vk.DebugUtilsMessengerEXT = {}
 VK_Debug_Level: vk.DebugUtilsMessageSeverityFlagsEXT = {.WARNING, .ERROR}
 VK_Validation_Layers := []cstring{"VK_LAYER_KHRONOS_validation"}
-
-check_vk_result :: proc(result: vk.Result, op: string, loc := #caller_location) {
-	if result == .SUCCESS do return
-	fail := context.assertion_failure_proc
-
-	when ODIN_DEBUG {
-		fail(op, reflect.enum_string(result), loc)
-	} else {
-		fail(op, "VK: operation failed", loc)
-	}
-}
-
-// ---------------------------------------------------------------------- UTILS
-
-check_b32 :: proc(result: b32, op: string, loc := #caller_location) {
-	if result do return
-	context.assertion_failure_proc(op, "false", loc)
-}
-
-check :: proc {
-	check_vk_result,
-	check_b32,
-}
-
-init_glfw :: proc() {
-	if !glfw.Init() {
-		fmt.eprintln("GLFW: failed to initialize")
-		os.exit(1)
-	} else {
-		fmt.println("GLFW: initialized")
-	}
-}
+VK_Required_Extensions := []cstring{vk.KHR_SWAPCHAIN_EXTENSION_NAME}
 
 // ---------------------------------------------------------------- VULKAN UTILS
 
-check_layer_support :: proc(required_layers: []cstring) -> b32 {
+
+check_layer_support :: proc(required_layers: []cstring) -> bool {
 	layer_count: u32
 	vk.EnumerateInstanceLayerProperties(&layer_count, nil)
 
@@ -97,6 +66,7 @@ debug_callback :: proc "system" (
 get_queue_families :: proc(
 	physical_device: vk.PhysicalDevice,
 	queue_flags: vk.QueueFlags,
+	surface: vk.SurfaceKHR,
 ) -> (
 	u32,
 	bool,
@@ -110,7 +80,14 @@ get_queue_families :: proc(
 	vk.GetPhysicalDeviceQueueFamilyProperties(physical_device, &count, raw_data(families))
 	for family, i in families {
 		if (queue_flags & family.queueFlags) == queue_flags {
-			return u32(i), true
+			// Surface is a non-dispatchable handle, not a pointer,
+			// its 0 value is like nil value of a pointer.
+			// This is needed beacuse sometimes we only want to check
+			// for certain features of queue families
+			// and do not look at the surface support.
+			if surface == 0 || is_surface_supported(physical_device, u32(i), surface) {
+				return u32(i), true
+			}
 		}
 	}
 
@@ -156,7 +133,7 @@ get_physical_device_features :: proc(
 	}
 }
 
-score_physical_device :: proc(physical_device: vk.PhysicalDevice) -> int {
+score_physical_device :: proc(physical_device: vk.PhysicalDevice, surface: vk.SurfaceKHR) -> int {
 	properties: vk.PhysicalDeviceProperties
 	vk.GetPhysicalDeviceProperties(physical_device, &properties)
 
@@ -174,12 +151,11 @@ score_physical_device :: proc(physical_device: vk.PhysicalDevice) -> int {
 		return -1
 	}
 
-	if _, ok := get_queue_families(physical_device, {.GRAPHICS}); !ok {
+	if _, ok := get_queue_families(physical_device, {.GRAPHICS}, surface); !ok {
 		fmt.printfln("  %q - no graphics queue (skipped)", name)
 		return -1
 	}
 
-	required_extensions := []cstring{vk.KHR_SWAPCHAIN_EXTENSION_NAME}
 
 	{
 		extension_count: u32
@@ -193,7 +169,7 @@ score_physical_device :: proc(physical_device: vk.PhysicalDevice) -> int {
 			raw_data(available_extensions),
 		)
 
-		for extension in required_extensions {
+		for extension in VK_Required_Extensions {
 			found := false
 			for &ext in available_extensions {
 				if cstring(&ext.extensionName[0]) == extension {
@@ -239,12 +215,32 @@ score_physical_device :: proc(physical_device: vk.PhysicalDevice) -> int {
 	return score
 }
 
+is_surface_supported :: proc(
+	physical_device: vk.PhysicalDevice,
+	queue_index: u32,
+	surface: vk.SurfaceKHR,
+) -> bool {
+	is_supported: b32
+
+	result := vk.GetPhysicalDeviceSurfaceSupportKHR(
+		physical_device,
+		queue_index,
+		surface,
+		&is_supported,
+	)
+
+	if result != .SUCCESS do return false
+	return bool(is_supported)
+}
+
 
 // ---------------------------------------------------------------- VULKAN SETUP
 
+
 create_instance :: proc() -> vk.Instance {
 	vk.load_proc_addresses(rawptr(glfw.GetInstanceProcAddress))
-	check(check_layer_support(VK_Validation_Layers), "validation layers not available")
+	ok := check_layer_support(VK_Validation_Layers)
+	assert(ok, "validation layers not available")
 
 	application_i := vk.ApplicationInfo {
 		sType              = .APPLICATION_INFO,
@@ -281,28 +277,25 @@ create_instance :: proc() -> vk.Instance {
 	}
 
 	instance: vk.Instance
-	check(vk.CreateInstance(&instance_ci, nil, &instance), "failed to create instance")
+	create_instance_result := vk.CreateInstance(&instance_ci, nil, &instance)
+	assert(create_instance_result == .SUCCESS, "failed to create instance")
+
 	fmt.println("VK: instance created")
 
 	vk.load_proc_addresses_instance(instance)
 
 	if vk.CreateDebugUtilsMessengerEXT != nil {
-		check(
-			vk.CreateDebugUtilsMessengerEXT(instance, &debug_ci, nil, &VK_Debug_Messenger),
-			"failed to create debug messenger",
-		)
+		ok := vk.CreateDebugUtilsMessengerEXT(instance, &debug_ci, nil, &VK_Debug_Messenger)
+		assert(ok == .SUCCESS, "failed to create debug messenger")
 	}
 
 	return instance
 }
 
-pick_physical_device :: proc(instance: vk.Instance) -> vk.PhysicalDevice {
+pick_physical_device :: proc(instance: vk.Instance, surface: vk.SurfaceKHR) -> vk.PhysicalDevice {
 	device_count: u32
 	vk.EnumeratePhysicalDevices(instance, &device_count, nil)
-	if device_count == 0 {
-		fmt.eprintln("failed to find GPUs with Vulkan support!")
-		os.exit(1)
-	}
+	assert(device_count != 0, "failed to find GPUs with vulkan support")
 
 	physical_devices := make([]vk.PhysicalDevice, device_count)
 	defer delete(physical_devices)
@@ -313,7 +306,7 @@ pick_physical_device :: proc(instance: vk.Instance) -> vk.PhysicalDevice {
 	best_device: vk.PhysicalDevice = nil
 
 	for device in physical_devices {
-		score := score_physical_device(device)
+		score := score_physical_device(device, surface)
 
 		if score > best_score {
 			best_score = score
@@ -330,21 +323,138 @@ pick_physical_device :: proc(instance: vk.Instance) -> vk.PhysicalDevice {
 	return best_device
 }
 
-// ----------------------------------------------------------------- APPLICATION
+create_logical_device :: proc(
+	physical_device: vk.PhysicalDevice,
+	surface: vk.SurfaceKHR,
+) -> (
+	vk.Device,
+	vk.Queue,
+) {
+	queue_index, ok := get_queue_families(physical_device, {.GRAPHICS}, surface)
+	assert(ok, "no graphics queue found on physical device")
 
-main :: proc() {
-	fmt.println("---- Vulkan Tutorial Odin ----")
-
-	init_glfw()
-	instance := create_instance()
-
-	_ = pick_physical_device(instance)
-
-	if instance != nil && vk.DestroyDebugUtilsMessengerEXT != nil {
-		vk.DestroyDebugUtilsMessengerEXT(instance, VK_Debug_Messenger, nil)
+	queue_priority: f32 = 0.5
+	queue_ci := vk.DeviceQueueCreateInfo {
+		sType            = .DEVICE_QUEUE_CREATE_INFO,
+		queueFamilyIndex = queue_index,
+		queueCount       = 1,
+		pQueuePriorities = &queue_priority,
 	}
 
-	if instance != nil {
-		vk.DestroyInstance(instance, nil)
+	df_extended_dynamic_state := vk.PhysicalDeviceExtendedDynamicStateFeaturesEXT {
+		sType                = .PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT,
+		extendedDynamicState = true,
+	}
+
+	df_vulkan13 := vk.PhysicalDeviceVulkan13Features {
+		sType            = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+		dynamicRendering = true,
+		pNext            = &df_extended_dynamic_state,
+	}
+
+	df_vulkan11 := vk.PhysicalDeviceVulkan11Features {
+		sType                = .PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+		shaderDrawParameters = true,
+		pNext                = &df_vulkan13,
+	}
+
+	df_2 := vk.PhysicalDeviceFeatures2 {
+		sType = .PHYSICAL_DEVICE_FEATURES_2,
+		pNext = &df_vulkan11,
+	}
+
+	logical_device_ci := vk.DeviceCreateInfo {
+		sType                   = .DEVICE_CREATE_INFO,
+		pQueueCreateInfos       = &queue_ci,
+		queueCreateInfoCount    = 1,
+		enabledExtensionCount   = u32(len(VK_Required_Extensions)),
+		ppEnabledExtensionNames = raw_data(VK_Required_Extensions),
+		pNext                   = &df_2,
+	}
+
+	logical_device: vk.Device
+	result := vk.CreateDevice(physical_device, &logical_device_ci, nil, &logical_device)
+	assert(result == .SUCCESS, "failed to create logical device")
+
+	queue: vk.Queue
+	vk.GetDeviceQueue(logical_device, queue_index, 0, &queue)
+
+	return logical_device, queue
+}
+
+create_surface :: proc(instance: vk.Instance, window: Window) -> vk.SurfaceKHR {
+	surface: vk.SurfaceKHR
+	ok := glfw.CreateWindowSurface(instance, window.handle, nil, &surface)
+
+	return surface
+}
+
+// ------------------------------------------------------------------------ GLFW
+
+init_glfw :: proc() {
+	if !glfw.Init() {
+		fmt.eprintln("failed to initialize glfw")
+		os.exit(1)
+	} else {
+		fmt.println("initialized glfw")
+	}
+}
+
+Window :: struct {
+	handle: glfw.WindowHandle,
+	width:  u32,
+	height: u32,
+}
+
+create_window :: proc(width: u32, height: u32) -> Window {
+	glfw.WindowHint(glfw.RESIZABLE, 0)
+	glfw.WindowHint(glfw.CLIENT_API, glfw.NO_API)
+
+	handle := glfw.CreateWindow(i32(width), i32(height), "Vulkan Tutorial Odin", nil, nil)
+	assert(handle != nil, "unable to create window")
+
+	return Window{handle = handle, width = width, height = height}
+}
+
+// ----------------------------------------------------------------- APPLICATION
+
+is_running := true
+
+main :: proc() {
+	init_glfw()
+	defer glfw.Terminate()
+	fmt.println("GLFW initialized")
+
+	instance := create_instance()
+	defer vk.DestroyInstance(instance, nil)
+	defer vk.DestroyDebugUtilsMessengerEXT(instance, VK_Debug_Messenger, nil)
+	fmt.println("Vulkan instance created")
+	fmt.println("Vulkan debug messenger created")
+
+	window := create_window(800, 600)
+	fmt.println("GLFW window created")
+
+	surface := create_surface(instance, window)
+	fmt.println("Vulkan surface created")
+
+	physical_device := pick_physical_device(instance, surface)
+	fmt.println("Vulkan physical device picked")
+
+	logical_device, _ := create_logical_device(physical_device, surface)
+	defer vk.DestroyDevice(logical_device, nil)
+	fmt.println("Vulkan logical device created")
+
+	fmt.println("GLFW and Vulkan initialized")
+
+	key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action, mods: i32) {
+		if key == glfw.KEY_ESCAPE {
+			is_running = false
+		}
+	}
+
+	glfw.SetKeyCallback(window.handle, key_callback)
+
+	for !glfw.WindowShouldClose(window.handle) && is_running {
+		glfw.PollEvents()
 	}
 }
