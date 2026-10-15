@@ -8,13 +8,12 @@ import vk "vendor:vulkan"
 
 // ------------------------------------------------------------------- CONSTANTS
 
-VK_Debug_Messenger: vk.DebugUtilsMessengerEXT = {}
-VK_Debug_Level: vk.DebugUtilsMessageSeverityFlagsEXT = {.WARNING, .ERROR}
-VK_Validation_Layers := []cstring{"VK_LAYER_KHRONOS_validation"}
-VK_Required_Extensions := []cstring{vk.KHR_SWAPCHAIN_EXTENSION_NAME}
+VK_DEBUG_MESSENGER: vk.DebugUtilsMessengerEXT = {}
+VK_DEBUG_LEVEL: vk.DebugUtilsMessageSeverityFlagsEXT = {.WARNING, .ERROR}
+VK_VALIDATION_LAYERS := []cstring{"VK_LAYER_KHRONOS_validation"}
+VK_REQUIRED_EXTENSIONS := []cstring{vk.KHR_SWAPCHAIN_EXTENSION_NAME}
 
 // ---------------------------------------------------------------- VULKAN UTILS
-
 
 check_layer_support :: proc(required_layers: []cstring) -> bool {
 	layer_count: u32
@@ -50,13 +49,13 @@ debug_callback :: proc "system" (
 
 	if pCallbackData.pMessageIdName == "Loader Message" && .ERROR not_in messageSeverity do return false
 
-	if .ERROR in messageSeverity && .ERROR in VK_Debug_Level {
+	if .ERROR in messageSeverity && .ERROR in VK_DEBUG_LEVEL {
 		fmt.eprintfln("[validation ERROR] %s", pCallbackData.pMessage)
-	} else if .WARNING in messageSeverity && .WARNING in VK_Debug_Level {
+	} else if .WARNING in messageSeverity && .WARNING in VK_DEBUG_LEVEL {
 		fmt.eprintfln("[validation WARNING] %s", pCallbackData.pMessage)
-	} else if .INFO in messageSeverity && .INFO in VK_Debug_Level {
+	} else if .INFO in messageSeverity && .INFO in VK_DEBUG_LEVEL {
 		fmt.println("[validation INFO]", pCallbackData.pMessage)
-	} else if .VERBOSE in messageSeverity && .VERBOSE in VK_Debug_Level {
+	} else if .VERBOSE in messageSeverity && .VERBOSE in VK_DEBUG_LEVEL {
 		fmt.printfln("[validation VERBOSE] %s", pCallbackData.pMessage)
 	}
 
@@ -169,7 +168,7 @@ score_physical_device :: proc(physical_device: vk.PhysicalDevice, surface: vk.Su
 			raw_data(available_extensions),
 		)
 
-		for extension in VK_Required_Extensions {
+		for extension in VK_REQUIRED_EXTENSIONS {
 			found := false
 			for &ext in available_extensions {
 				if cstring(&ext.extensionName[0]) == extension {
@@ -233,13 +232,95 @@ is_surface_supported :: proc(
 	return bool(is_supported)
 }
 
+choose_swap_extent :: proc(
+	capabilities: vk.SurfaceCapabilitiesKHR,
+	window: Window,
+) -> vk.Extent2D {
+	// If the extent is the max value of u32,
+	// it has been chosen by the window compositor.
+	if capabilities.currentExtent.width != max(u32) {
+		return capabilities.currentExtent
+	}
+
+	return vk.Extent2D {
+		width = clamp(
+			window.width,
+			capabilities.minImageExtent.width,
+			capabilities.maxImageExtent.width,
+		),
+		height = clamp(
+			window.height,
+			capabilities.minImageExtent.height,
+			capabilities.maxImageExtent.height,
+		),
+	}
+}
+
+choose_swap_min_image_count :: proc(capabilities: vk.SurfaceCapabilitiesKHR) -> u32 {
+	count := max(3, capabilities.minImageCount)
+
+	if 0 < capabilities.maxImageCount && capabilities.maxImageCount < count {
+		count = capabilities.maxImageCount
+	}
+
+	return count
+}
+
+get_surface_formats :: proc(
+	physical_device: vk.PhysicalDevice,
+	surface: vk.SurfaceKHR,
+) -> []vk.SurfaceFormatKHR {
+	count: u32
+	vk.GetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &count, nil)
+	assert(count > 0, "no surface formats available")
+
+	formats := make([]vk.SurfaceFormatKHR, count)
+	vk.GetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &count, raw_data(formats))
+
+	return formats
+}
+
+choose_swap_surface_format :: proc(formats: []vk.SurfaceFormatKHR) -> vk.SurfaceFormatKHR {
+	for format in formats {
+		if format.format == .B8G8R8A8_SRGB && format.colorSpace == .SRGB_NONLINEAR {
+			return format
+		}
+	}
+
+	return formats[0]
+}
+
+get_present_modes :: proc(
+	physical_device: vk.PhysicalDevice,
+	surface: vk.SurfaceKHR,
+) -> []vk.PresentModeKHR {
+	count: u32
+	vk.GetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &count, nil)
+	assert(count > 0, "no preset modes available")
+
+	modes := make([]vk.PresentModeKHR, count)
+	vk.GetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &count, raw_data(modes))
+
+	return modes
+}
+
+choose_present_mode :: proc(modes: []vk.PresentModeKHR) -> vk.PresentModeKHR {
+	for mode in modes {
+		if mode == .MAILBOX {
+			return mode
+		}
+	}
+
+	return .FIFO
+}
+
 
 // ---------------------------------------------------------------- VULKAN SETUP
 
 
 create_instance :: proc() -> vk.Instance {
 	vk.load_proc_addresses(rawptr(glfw.GetInstanceProcAddress))
-	ok := check_layer_support(VK_Validation_Layers)
+	ok := check_layer_support(VK_VALIDATION_LAYERS)
 	assert(ok, "validation layers not available")
 
 	application_i := vk.ApplicationInfo {
@@ -260,7 +341,7 @@ create_instance :: proc() -> vk.Instance {
 
 	debug_ci := vk.DebugUtilsMessengerCreateInfoEXT {
 		sType           = .DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-		messageSeverity = VK_Debug_Level,
+		messageSeverity = VK_DEBUG_LEVEL,
 		messageType     = {.GENERAL, .VALIDATION, .PERFORMANCE},
 		pfnUserCallback = debug_callback,
 		pUserData       = nil,
@@ -271,8 +352,8 @@ create_instance :: proc() -> vk.Instance {
 		pApplicationInfo        = &application_i,
 		enabledExtensionCount   = u32(len(extension_names)),
 		ppEnabledExtensionNames = raw_data(extension_names[:]),
-		enabledLayerCount       = u32(len(VK_Validation_Layers)),
-		ppEnabledLayerNames     = raw_data(VK_Validation_Layers),
+		enabledLayerCount       = u32(len(VK_VALIDATION_LAYERS)),
+		ppEnabledLayerNames     = raw_data(VK_VALIDATION_LAYERS),
 		pNext                   = &debug_ci,
 	}
 
@@ -285,14 +366,17 @@ create_instance :: proc() -> vk.Instance {
 	vk.load_proc_addresses_instance(instance)
 
 	if vk.CreateDebugUtilsMessengerEXT != nil {
-		ok := vk.CreateDebugUtilsMessengerEXT(instance, &debug_ci, nil, &VK_Debug_Messenger)
+		ok := vk.CreateDebugUtilsMessengerEXT(instance, &debug_ci, nil, &VK_DEBUG_MESSENGER)
 		assert(ok == .SUCCESS, "failed to create debug messenger")
 	}
 
 	return instance
 }
 
-pick_physical_device :: proc(instance: vk.Instance, surface: vk.SurfaceKHR) -> vk.PhysicalDevice {
+choose_physical_device :: proc(
+	instance: vk.Instance,
+	surface: vk.SurfaceKHR,
+) -> vk.PhysicalDevice {
 	device_count: u32
 	vk.EnumeratePhysicalDevices(instance, &device_count, nil)
 	assert(device_count != 0, "failed to find GPUs with vulkan support")
@@ -367,8 +451,8 @@ create_logical_device :: proc(
 		sType                   = .DEVICE_CREATE_INFO,
 		pQueueCreateInfos       = &queue_ci,
 		queueCreateInfoCount    = 1,
-		enabledExtensionCount   = u32(len(VK_Required_Extensions)),
-		ppEnabledExtensionNames = raw_data(VK_Required_Extensions),
+		enabledExtensionCount   = u32(len(VK_REQUIRED_EXTENSIONS)),
+		ppEnabledExtensionNames = raw_data(VK_REQUIRED_EXTENSIONS),
 		pNext                   = &df_2,
 	}
 
@@ -389,15 +473,75 @@ create_surface :: proc(instance: vk.Instance, window: Window) -> vk.SurfaceKHR {
 	return surface
 }
 
+create_swap_chain :: proc(
+	physical_device: vk.PhysicalDevice,
+	logical_device: vk.Device,
+	surface: vk.SurfaceKHR,
+	window: Window,
+) -> vk.SwapchainKHR {
+	surface_capabilities: vk.SurfaceCapabilitiesKHR
+	surface_result := vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(
+		physical_device,
+		surface,
+		&surface_capabilities,
+	)
+
+	assert(surface_result == .SUCCESS, "failed to get surface capabilities")
+
+	extent := choose_swap_extent(surface_capabilities, window)
+	min_image_count := choose_swap_min_image_count(surface_capabilities)
+
+	formats := get_surface_formats(physical_device, surface)
+	defer delete(formats)
+
+	format := choose_swap_surface_format(formats)
+	preset_modes := get_present_modes(physical_device, surface)
+	defer delete(preset_modes)
+
+	present_mode := choose_present_mode(preset_modes)
+
+	swap_chain_ci := vk.SwapchainCreateInfoKHR {
+		sType            = .SWAPCHAIN_CREATE_INFO_KHR,
+		surface          = surface,
+		minImageCount    = min_image_count,
+		imageFormat      = format.format,
+		imageColorSpace  = format.colorSpace,
+		imageExtent      = extent,
+		imageArrayLayers = 1,
+		imageUsage       = {.COLOR_ATTACHMENT},
+		imageSharingMode = .EXCLUSIVE,
+		preTransform     = surface_capabilities.currentTransform,
+		compositeAlpha   = {.OPAQUE},
+		presentMode      = present_mode,
+		clipped          = true,
+	}
+
+	swap_chain: vk.SwapchainKHR
+	swap_chain_result := vk.CreateSwapchainKHR(logical_device, &swap_chain_ci, nil, &swap_chain)
+	assert(swap_chain_result == .SUCCESS, "failed to create swap chain")
+
+	return swap_chain
+}
+
+get_swap_chain_images :: proc(
+	logical_device: vk.Device,
+	swap_chain: vk.SwapchainKHR,
+) -> []vk.Image {
+	count: u32
+	vk.GetSwapchainImagesKHR(logical_device, swap_chain, &count, nil)
+	assert(count > 0, "no swap chain images are available")
+
+	images := make([]vk.Image, count)
+	vk.GetSwapchainImagesKHR(logical_device, swap_chain, &count, raw_data(images))
+
+	return images
+}
+
 // ------------------------------------------------------------------------ GLFW
 
 init_glfw :: proc() {
-	if !glfw.Init() {
-		fmt.eprintln("failed to initialize glfw")
-		os.exit(1)
-	} else {
-		fmt.println("initialized glfw")
-	}
+	result := glfw.Init()
+	assert(bool(result), "failedto initialize GLFW")
 }
 
 Window :: struct {
@@ -427,7 +571,7 @@ main :: proc() {
 
 	instance := create_instance()
 	defer vk.DestroyInstance(instance, nil)
-	defer vk.DestroyDebugUtilsMessengerEXT(instance, VK_Debug_Messenger, nil)
+	defer vk.DestroyDebugUtilsMessengerEXT(instance, VK_DEBUG_MESSENGER, nil)
 	fmt.println("Vulkan instance created")
 	fmt.println("Vulkan debug messenger created")
 
@@ -437,12 +581,20 @@ main :: proc() {
 	surface := create_surface(instance, window)
 	fmt.println("Vulkan surface created")
 
-	physical_device := pick_physical_device(instance, surface)
+	physical_device := choose_physical_device(instance, surface)
 	fmt.println("Vulkan physical device picked")
 
 	logical_device, _ := create_logical_device(physical_device, surface)
 	defer vk.DestroyDevice(logical_device, nil)
 	fmt.println("Vulkan logical device created")
+
+	swap_chain := create_swap_chain(physical_device, logical_device, surface, window)
+	defer vk.DestroySwapchainKHR(logical_device, swap_chain, nil)
+	fmt.println("Vulkan swap chain created")
+
+	swap_chain_images := get_swap_chain_images(logical_device, swap_chain)
+	defer delete(swap_chain_images)
+	fmt.println("Vulkan swap chain images available")
 
 	fmt.println("GLFW and Vulkan initialized")
 
