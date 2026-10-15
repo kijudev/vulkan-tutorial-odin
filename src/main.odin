@@ -478,7 +478,10 @@ create_swap_chain :: proc(
 	logical_device: vk.Device,
 	surface: vk.SurfaceKHR,
 	window: Window,
-) -> vk.SwapchainKHR {
+) -> (
+	vk.SwapchainKHR,
+	vk.Format,
+) {
 	surface_capabilities: vk.SurfaceCapabilitiesKHR
 	surface_result := vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(
 		physical_device,
@@ -520,7 +523,7 @@ create_swap_chain :: proc(
 	swap_chain_result := vk.CreateSwapchainKHR(logical_device, &swap_chain_ci, nil, &swap_chain)
 	assert(swap_chain_result == .SUCCESS, "failed to create swap chain")
 
-	return swap_chain
+	return swap_chain, format.format
 }
 
 get_swap_chain_images :: proc(
@@ -537,11 +540,33 @@ get_swap_chain_images :: proc(
 	return images
 }
 
+create_image_views :: proc(
+	logical_device: vk.Device,
+	images: []vk.Image,
+	format: vk.Format,
+) -> []vk.ImageView {
+	image_view_ci := vk.ImageViewCreateInfo {
+		sType            = .IMAGE_VIEW_CREATE_INFO,
+		viewType         = .D2,
+		format           = format,
+		subresourceRange = {{.COLOR}, 0, 1, 0, 1},
+	}
+
+	image_views := make([]vk.ImageView, len(images))
+	for image, i in images {
+		image_view_ci.image = image
+		result := vk.CreateImageView(logical_device, &image_view_ci, nil, &image_views[i])
+		assert(result == .SUCCESS, "failed to create image view")
+	}
+
+	return image_views
+}
+
 // ------------------------------------------------------------------------ GLFW
 
 init_glfw :: proc() {
 	result := glfw.Init()
-	assert(bool(result), "failedto initialize GLFW")
+	assert(bool(result), "failed to initialize GLFW")
 }
 
 Window :: struct {
@@ -588,13 +613,32 @@ main :: proc() {
 	defer vk.DestroyDevice(logical_device, nil)
 	fmt.println("Vulkan logical device created")
 
-	swap_chain := create_swap_chain(physical_device, logical_device, surface, window)
+	swap_chain, swap_chain_format := create_swap_chain(
+		physical_device,
+		logical_device,
+		surface,
+		window,
+	)
 	defer vk.DestroySwapchainKHR(logical_device, swap_chain, nil)
 	fmt.println("Vulkan swap chain created")
 
 	swap_chain_images := get_swap_chain_images(logical_device, swap_chain)
 	defer delete(swap_chain_images)
 	fmt.println("Vulkan swap chain images available")
+
+	swap_chain_image_views := create_image_views(
+		logical_device,
+		swap_chain_images,
+		swap_chain_format,
+	)
+
+	defer {
+		for view in swap_chain_image_views {
+			vk.DestroyImageView(logical_device, view, nil)
+		}
+
+		delete(swap_chain_image_views)
+	}
 
 	fmt.println("GLFW and Vulkan initialized")
 
