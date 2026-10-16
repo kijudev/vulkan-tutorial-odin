@@ -195,6 +195,10 @@ score_physical_device :: proc(physical_device: vk.PhysicalDevice, surface: vk.Su
 		fmt.printfln("  %q - missing dynamicRendering (skipped)", name)
 		return -1
 	}
+	if !features.vulkan13.synchronization2 {
+		fmt.printfln("  %q - missing synchronization2 (skipped)", name)
+		return -1
+	}
 	if !features.extended_dynamic_state.extendedDynamicState {
 		fmt.printfln("  %q - missing extendedDynamicState (skipped)", name)
 		return -1
@@ -316,6 +320,169 @@ choose_present_mode :: proc(modes: []vk.PresentModeKHR) -> vk.PresentModeKHR {
 	return .FIFO
 }
 
+create_command_pool :: proc(
+	logical_device: vk.Device,
+	physical_device: vk.PhysicalDevice,
+) -> vk.CommandPool {
+	queue_index, ok := get_queue_families(physical_device, {.GRAPHICS}, 0)
+	assert(ok, "failed to find queue index for graphics")
+
+	command_pool_ci := vk.CommandPoolCreateInfo {
+		sType            = .COMMAND_POOL_CREATE_INFO,
+		flags            = {.RESET_COMMAND_BUFFER},
+		queueFamilyIndex = queue_index,
+	}
+
+	command_pool: vk.CommandPool
+	command_pool_result := vk.CreateCommandPool(
+		logical_device,
+		&command_pool_ci,
+		nil,
+		&command_pool,
+	)
+
+	assert(command_pool_result == .SUCCESS, "failed to create command pool")
+
+	return command_pool
+}
+
+create_command_buffer :: proc(
+	logical_device: vk.Device,
+	command_pool: vk.CommandPool,
+) -> vk.CommandBuffer {
+	allocation_i := vk.CommandBufferAllocateInfo {
+		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
+		commandPool        = command_pool,
+		level              = .PRIMARY,
+		commandBufferCount = 1,
+	}
+
+	command_buffers := make([]vk.CommandBuffer, 1)
+	command_buffers_result := vk.AllocateCommandBuffers(
+		logical_device,
+		&allocation_i,
+		raw_data(command_buffers),
+	)
+
+	assert(command_buffers_result == .SUCCESS, "failed to create command buffers")
+
+	return command_buffers[0]
+}
+
+begin_command_buffer :: proc(command_buffer: vk.CommandBuffer) {
+	begin_i := vk.CommandBufferBeginInfo {
+		sType            = .COMMAND_BUFFER_BEGIN_INFO,
+		flags            = {},
+		pInheritanceInfo = nil,
+	}
+
+	result := vk.BeginCommandBuffer(command_buffer, &begin_i)
+	assert(result == .SUCCESS, "failed to begin command buffer")
+}
+
+transition_image_layout :: proc(
+	command_buffer: vk.CommandBuffer,
+	image: vk.Image,
+	old_layout: vk.ImageLayout,
+	new_layout: vk.ImageLayout,
+	src_access_mask: vk.AccessFlags2,
+	dst_access_mask: vk.AccessFlags2,
+	src_stage_mask: vk.PipelineStageFlags2,
+	dst_stage_mask: vk.PipelineStageFlags2,
+) {
+
+	image_barrier := vk.ImageMemoryBarrier2 {
+		sType = .IMAGE_MEMORY_BARRIER_2,
+		srcStageMask = src_stage_mask,
+		srcAccessMask = src_access_mask,
+		dstStageMask = dst_stage_mask,
+		dstAccessMask = dst_access_mask,
+		oldLayout = old_layout,
+		newLayout = new_layout,
+		srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		image = image,
+		subresourceRange = vk.ImageSubresourceRange {
+			aspectMask = {.COLOR},
+			baseMipLevel = 0,
+			levelCount = 1,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+	}
+
+	dependency_i := vk.DependencyInfo {
+		sType                    = .DEPENDENCY_INFO,
+		dependencyFlags          = {},
+		memoryBarrierCount       = 0,
+		pMemoryBarriers          = nil,
+		bufferMemoryBarrierCount = 0,
+		pBufferMemoryBarriers    = nil,
+		imageMemoryBarrierCount  = 1,
+		pImageMemoryBarriers     = &image_barrier,
+	}
+
+	vk.CmdPipelineBarrier2(command_buffer, &dependency_i)
+}
+
+begin_rendering :: proc(
+	command_buffer: vk.CommandBuffer,
+	image_view: vk.ImageView,
+	swap_chain_extent: vk.Extent2D,
+) {
+	attachment_i := vk.RenderingAttachmentInfo {
+		sType = .RENDERING_ATTACHMENT_INFO,
+		imageView = image_view,
+		imageLayout = .COLOR_ATTACHMENT_OPTIMAL,
+		loadOp = .CLEAR,
+		storeOp = .STORE,
+		clearValue = {color = {float32 = {0.0, 0.0, 0.0, 1.0}}},
+	}
+
+	render_i := vk.RenderingInfo {
+		sType = .RENDERING_INFO,
+		layerCount = 1,
+		renderArea = {extent = swap_chain_extent},
+		pColorAttachments = &attachment_i,
+		colorAttachmentCount = 1,
+	}
+
+	vk.CmdBeginRendering(command_buffer, &render_i)
+}
+
+set_viewport :: proc(command_buffer: vk.CommandBuffer, swap_chain_extent: vk.Extent2D) {
+	viewport := vk.Viewport {
+		x        = 0,
+		y        = 0,
+		width    = f32(swap_chain_extent.width),
+		height   = f32(swap_chain_extent.height),
+		minDepth = 0.0,
+		maxDepth = 1.0,
+	}
+
+	vk.CmdSetViewport(command_buffer, 0, 1, &viewport)
+}
+
+set_scissor :: proc(command_buffer: vk.CommandBuffer, swap_chain_extent: vk.Extent2D) {
+	scissor := vk.Rect2D {
+		offset = {x = 0, y = 0},
+		extent = {swap_chain_extent.width, swap_chain_extent.height},
+	}
+
+	vk.CmdSetScissor(command_buffer, 0, 1, &scissor)
+}
+
+
+end_rendering :: proc(command_buffer: vk.CommandBuffer) {
+	vk.CmdEndRendering(command_buffer)
+}
+
+
+end_command_buffer :: proc(command_buffer: vk.CommandBuffer) {
+	result := vk.EndCommandBuffer(command_buffer)
+	assert(result == .SUCCESS, "failed to end command buffer")
+}
+
 
 // ---------------------------------------------------------------- VULKAN SETUP
 
@@ -435,6 +602,7 @@ create_logical_device :: proc(
 	df_vulkan13 := vk.PhysicalDeviceVulkan13Features {
 		sType            = .PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
 		dynamicRendering = true,
+		synchronization2 = true,
 		pNext            = &df_extended_dynamic_state,
 	}
 
@@ -750,6 +918,64 @@ create_graphics_pipeline :: proc(
 	return graphics_pipeline, pipeline_layout
 }
 
+record_command_buffer :: proc(
+	command_buffer: vk.CommandBuffer,
+	image: vk.Image,
+	image_view: vk.ImageView,
+	swap_chain_extent: vk.Extent2D,
+	graphics_pipeline: vk.Pipeline,
+) {
+
+	// Begin to start the recording...
+	begin_command_buffer(command_buffer)
+
+	// Transfert the image to ColorAttachmentOptimal
+	transition_image_layout(
+		command_buffer,
+		image,
+		.UNDEFINED,
+		.COLOR_ATTACHMENT_OPTIMAL,
+		{}, // srcAccessMask
+		{.COLOR_ATTACHMENT_WRITE}, // dstAccessMask
+		{.COLOR_ATTACHMENT_OUTPUT}, // srcStage
+		{.COLOR_ATTACHMENT_OUTPUT}, // dstStage
+	)
+
+	// Start rendering
+	begin_rendering(command_buffer, image_view, swap_chain_extent)
+
+	// We can now bind the graphics pipeline
+	vk.CmdBindPipeline(command_buffer, .GRAPHICS, graphics_pipeline)
+
+	// Set viewport
+	set_viewport(command_buffer, swap_chain_extent)
+
+	// Set scissor
+	set_scissor(command_buffer, swap_chain_extent)
+
+	// Draw 3 vertices
+	vk.CmdDraw(command_buffer, 3, 1, 0, 0)
+
+	// End the rendering
+	end_rendering(command_buffer)
+
+	// After rendering, we need to
+	// transition the image layout to PresentSrcKHR so it can be
+	// displayed on the screen.
+	transition_image_layout(
+		command_buffer,
+		image,
+		.COLOR_ATTACHMENT_OPTIMAL,
+		.PRESENT_SRC_KHR,
+		{.COLOR_ATTACHMENT_WRITE}, // srcAccessMask
+		{}, // dstAccessMask
+		{.COLOR_ATTACHMENT_OUTPUT}, // srcStage
+		{.BOTTOM_OF_PIPE}, // dstStage
+	)
+
+	end_command_buffer(command_buffer)
+}
+
 
 // ------------------------------------------------------------------------ GLFW
 
@@ -802,7 +1028,7 @@ main :: proc() {
 	defer vk.DestroyDevice(logical_device, nil)
 	fmt.println("Vulkan logical device created")
 
-	swap_chain, swap_chain_format, _ := create_swap_chain(
+	swap_chain, swap_chain_format, swap_chain_extent := create_swap_chain(
 		physical_device,
 		logical_device,
 		surface,
@@ -848,7 +1074,21 @@ main :: proc() {
 	defer vk.DestroyPipelineLayout(logical_device, pipeline_layout, nil)
 	fmt.println("Vulkan pipeline layout created")
 
-	fmt.println("GLFW and Vulkan initialized")
+	command_pool := create_command_pool(logical_device, physical_device)
+	defer vk.DestroyCommandPool(logical_device, command_pool, nil)
+	fmt.println("Vulkan command pool created")
+
+	command_buffer := create_command_buffer(logical_device, command_pool)
+	fmt.println("Vulkan command buffer created")
+
+	record_command_buffer(
+		command_buffer,
+		swap_chain_images[0],
+		swap_chain_image_views[0],
+		swap_chain_extent,
+		graphics_pipeline,
+	)
+	fmt.println("command buffer recorded")
 
 	key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action, mods: i32) {
 		if key == glfw.KEY_ESCAPE {
