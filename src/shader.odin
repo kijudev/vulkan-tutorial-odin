@@ -81,21 +81,3 @@ compile_slang_shader :: proc(slang_path: string, entry_points: []string) -> ([]b
 
 	return spv, true
 }
-
-main :: proc() {
-	fmt.println("Shaders compilation")
-	fmt.println("-------------------------------------------")
-
-	fmt.println()
-	fmt.println("Compiling...")
-
-	spv, ok := compile_slang_shader("./shader/shader.slang", {"vertMain", "fragMain"})
-
-	if !ok {
-		fmt.eprintln("Shader compilation failed.")
-		os.exit(1)
-	}
-
-	defer delete(spv)
-	fmt.printfln("Shaders compiled with success! SPIR-V size: %d bytes", len(spv))
-}

@@ -3,6 +3,8 @@ package main
 import "base:runtime"
 import "core:fmt"
 import "core:os"
+import "core:slice"
+import "core:strings"
 import "vendor:glfw"
 import vk "vendor:vulkan"
 
@@ -481,6 +483,7 @@ create_swap_chain :: proc(
 ) -> (
 	vk.SwapchainKHR,
 	vk.Format,
+	vk.Extent2D,
 ) {
 	surface_capabilities: vk.SurfaceCapabilitiesKHR
 	surface_result := vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(
@@ -523,7 +526,7 @@ create_swap_chain :: proc(
 	swap_chain_result := vk.CreateSwapchainKHR(logical_device, &swap_chain_ci, nil, &swap_chain)
 	assert(swap_chain_result == .SUCCESS, "failed to create swap chain")
 
-	return swap_chain, format.format
+	return swap_chain, format.format, extent
 }
 
 get_swap_chain_images :: proc(
@@ -561,6 +564,192 @@ create_image_views :: proc(
 
 	return image_views
 }
+
+create_shader_module :: proc(
+	logical_device: vk.Device,
+	slang_path: string,
+	entry_points: []string,
+) -> vk.ShaderModule {
+	spv, ok := compile_slang_shader(slang_path, entry_points)
+	assert(ok, "shader compilation failed")
+
+	defer delete(spv)
+
+	shader_module_ci := vk.ShaderModuleCreateInfo {
+		sType    = .SHADER_MODULE_CREATE_INFO,
+		codeSize = len(spv),
+		pCode    = raw_data(slice.reinterpret([]u32, spv)),
+	}
+
+	shader_module: vk.ShaderModule
+	result := vk.CreateShaderModule(logical_device, &shader_module_ci, nil, &shader_module)
+	assert(result == .SUCCESS, "failed to create shader module")
+
+	return shader_module
+}
+
+create_graphics_pipeline :: proc(
+	logical_device: vk.Device,
+	shader_module: vk.ShaderModule,
+	vertex_entry: string,
+	fragment_entry: string,
+	swap_chain_format: vk.Format,
+) -> (
+	vk.Pipeline,
+	vk.PipelineLayout,
+) {
+	vertex_entry_cstring := strings.clone_to_cstring(vertex_entry)
+	defer delete(vertex_entry_cstring)
+
+	fragment_entry_cstring := strings.clone_to_cstring(fragment_entry)
+	defer delete(fragment_entry_cstring)
+
+	shaders_ci := []vk.PipelineShaderStageCreateInfo {
+		{
+			sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+			stage = {.VERTEX},
+			module = shader_module,
+			pName = vertex_entry_cstring,
+		},
+		{
+			sType = .PIPELINE_SHADER_STAGE_CREATE_INFO,
+			stage = {.FRAGMENT},
+			module = shader_module,
+			pName = fragment_entry_cstring,
+		},
+	}
+
+	// What can be dynamic in the pipeline.
+	// What things can be mutated without creating a new pipeline.
+	dynamic_states := []vk.DynamicState{.VIEWPORT, .SCISSOR}
+	dynamic_state_ci := vk.PipelineDynamicStateCreateInfo {
+		sType             = .PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+		dynamicStateCount = u32(len(dynamic_states)),
+		pDynamicStates    = raw_data(dynamic_states),
+	}
+
+	// Vertex input.
+	// Configure the data format of vertices.
+	// For now the vertices are hardcoded in shaders themselves.
+	vertex_input_ci := vk.PipelineVertexInputStateCreateInfo {
+		sType                           = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+		vertexBindingDescriptionCount   = 0,
+		pVertexBindingDescriptions      = nil,
+		vertexAttributeDescriptionCount = 0,
+		pVertexAttributeDescriptions    = nil,
+	}
+
+	// Input assembly.
+	// Configure topology.
+	input_assembly_ci := vk.PipelineInputAssemblyStateCreateInfo {
+		sType                  = .PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+		topology               = .TRIANGLE_LIST,
+		primitiveRestartEnable = false,
+	}
+
+	// These are dynamic as set previously.
+	viewport_state_ci := vk.PipelineViewportStateCreateInfo {
+		sType         = .PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+		viewportCount = 1,
+		scissorCount  = 1,
+	}
+
+	rasterizer_ci := vk.PipelineRasterizationStateCreateInfo {
+		sType                   = .PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+		depthClampEnable        = false,
+		rasterizerDiscardEnable = false,
+		polygonMode             = .FILL,
+		cullMode                = {.BACK},
+		frontFace               = .CLOCKWISE,
+		depthBiasEnable         = false,
+		lineWidth               = 1,
+	}
+
+	multisampling_ci := vk.PipelineMultisampleStateCreateInfo {
+		sType                 = .PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+		sampleShadingEnable   = false,
+		rasterizationSamples  = {._1},
+		minSampleShading      = 1,
+		pSampleMask           = nil,
+		alphaToCoverageEnable = false,
+		alphaToOneEnable      = false,
+	}
+
+	color_blend_attachment := vk.PipelineColorBlendAttachmentState {
+		blendEnable         = true,
+		srcColorBlendFactor = .SRC_ALPHA,
+		dstColorBlendFactor = .ONE_MINUS_SRC_ALPHA,
+		colorBlendOp        = .ADD,
+		srcAlphaBlendFactor = .ONE,
+		dstAlphaBlendFactor = .ZERO,
+		alphaBlendOp        = .ADD,
+		colorWriteMask      = {.R, .G, .B, .A},
+	}
+
+	color_blend_ci := vk.PipelineColorBlendStateCreateInfo {
+		sType           = .PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+		logicOpEnable   = false,
+		logicOp         = .COPY,
+		attachmentCount = 1,
+		pAttachments    = &color_blend_attachment,
+	}
+
+	pipeline_layout_ci := vk.PipelineLayoutCreateInfo {
+		sType                  = .PIPELINE_LAYOUT_CREATE_INFO,
+		setLayoutCount         = 0,
+		pSetLayouts            = nil,
+		pushConstantRangeCount = 0,
+		pPushConstantRanges    = nil,
+	}
+
+	pipeline_layout: vk.PipelineLayout
+	pipeline_layout_result := vk.CreatePipelineLayout(
+		logical_device,
+		&pipeline_layout_ci,
+		nil,
+		&pipeline_layout,
+	)
+
+	assert(pipeline_layout_result == .SUCCESS, "failed to create pipeline layout")
+
+	format := swap_chain_format
+	pipeline_rendering_ci := vk.PipelineRenderingCreateInfo {
+		sType                   = .PIPELINE_RENDERING_CREATE_INFO,
+		colorAttachmentCount    = 1,
+		pColorAttachmentFormats = &format,
+	}
+
+	pipeline_ci := vk.GraphicsPipelineCreateInfo {
+		sType               = .GRAPHICS_PIPELINE_CREATE_INFO,
+		stageCount          = 2,
+		pStages             = raw_data(shaders_ci),
+		pVertexInputState   = &vertex_input_ci,
+		pInputAssemblyState = &input_assembly_ci,
+		pViewportState      = &viewport_state_ci,
+		pRasterizationState = &rasterizer_ci,
+		pMultisampleState   = &multisampling_ci,
+		pColorBlendState    = &color_blend_ci,
+		pDynamicState       = &dynamic_state_ci,
+		layout              = pipeline_layout,
+		renderPass          = 0,
+		pNext               = &pipeline_rendering_ci,
+	}
+
+	graphics_pipeline: vk.Pipeline
+	graphics_pipeline_result := vk.CreateGraphicsPipelines(
+		logical_device,
+		0,
+		1,
+		&pipeline_ci,
+		nil,
+		&graphics_pipeline,
+	)
+
+	assert(graphics_pipeline_result == .SUCCESS, "failed to create graphics pipeline")
+
+	return graphics_pipeline, pipeline_layout
+}
+
 
 // ------------------------------------------------------------------------ GLFW
 
@@ -613,12 +802,13 @@ main :: proc() {
 	defer vk.DestroyDevice(logical_device, nil)
 	fmt.println("Vulkan logical device created")
 
-	swap_chain, swap_chain_format := create_swap_chain(
+	swap_chain, swap_chain_format, _ := create_swap_chain(
 		physical_device,
 		logical_device,
 		surface,
 		window,
 	)
+
 	defer vk.DestroySwapchainKHR(logical_device, swap_chain, nil)
 	fmt.println("Vulkan swap chain created")
 
@@ -639,6 +829,24 @@ main :: proc() {
 
 		delete(swap_chain_image_views)
 	}
+
+	shader_module := create_shader_module(
+		logical_device,
+		"shaders/shader.slang",
+		{"vertMain", "fragMain"},
+	)
+	defer vk.DestroyShaderModule(logical_device, shader_module, nil)
+	fmt.println("Vulkan shader module created")
+
+	graphics_pipeline, pipeline_layout := create_graphics_pipeline(
+		logical_device,
+		shader_module,
+		"vertMain",
+		"fragMain",
+		swap_chain_format,
+	)
+	defer vk.DestroyPipelineLayout(logical_device, pipeline_layout, nil)
+	fmt.println("Vulkan pipeline layout created")
 
 	fmt.println("GLFW and Vulkan initialized")
 
