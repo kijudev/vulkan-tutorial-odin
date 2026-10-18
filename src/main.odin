@@ -242,20 +242,24 @@ choose_swap_extent :: proc(
 	capabilities: vk.SurfaceCapabilitiesKHR,
 	window: Window,
 ) -> vk.Extent2D {
-	// If the extent is the max value of u32,
+	// If the extent is NOT the max value of u32,
 	// it has been chosen by the window compositor.
 	if capabilities.currentExtent.width != max(u32) {
 		return capabilities.currentExtent
 	}
 
+	// Otherwise use the framebuffer size in pixels, which can differ
+	// from the window size in screen coordinates (e.g. HiDPI scaling).
+	fb_width, fb_height := glfw.GetFramebufferSize(window.handle)
+
 	return vk.Extent2D {
 		width = clamp(
-			window.width,
+			u32(fb_width),
 			capabilities.minImageExtent.width,
 			capabilities.maxImageExtent.width,
 		),
 		height = clamp(
-			window.height,
+			u32(fb_height),
 			capabilities.minImageExtent.height,
 			capabilities.maxImageExtent.height,
 		),
@@ -483,6 +487,72 @@ end_command_buffer :: proc(command_buffer: vk.CommandBuffer) {
 	assert(result == .SUCCESS, "failed to end command buffer")
 }
 
+create_semaphore :: proc(logical_device: vk.Device) -> vk.Semaphore {
+	semaphore_ci := vk.SemaphoreCreateInfo {
+		sType = .SEMAPHORE_CREATE_INFO,
+		flags = {},
+	}
+
+	semaphore: vk.Semaphore
+	semaphore_result := vk.CreateSemaphore(logical_device, &semaphore_ci, nil, &semaphore)
+	assert(semaphore_result == .SUCCESS, "failed to create semaphore")
+
+	return semaphore
+}
+
+create_fence :: proc(logical_device: vk.Device) -> vk.Fence {
+	fence_ci := vk.FenceCreateInfo {
+		sType = .FENCE_CREATE_INFO,
+		flags = {.SIGNALED},
+	}
+
+	fence: vk.Fence
+	fence_result := vk.CreateFence(logical_device, &fence_ci, nil, &fence)
+	assert(fence_result == .SUCCESS, "failed to create fence")
+
+	return fence
+}
+
+wait_for_fence :: proc(logical_device: vk.Device, fence: vk.Fence) {
+	fence := fence
+	fence_result := vk.WaitForFences(logical_device, 1, &fence, true, max(u64))
+	assert(fence_result == .SUCCESS, "failed to wait for fence")
+}
+
+reset_fence :: proc(logical_device: vk.Device, fence: vk.Fence) {
+	fence := fence
+	fence_result := vk.ResetFences(logical_device, 1, &fence)
+	assert(fence_result == .SUCCESS, "failed to wait for fence")
+}
+
+acquire_next_image :: proc(
+	logical_device: vk.Device,
+	swap_chain: vk.SwapchainKHR,
+	draw_fence: vk.Fence,
+	acquire_semaphore: vk.Semaphore,
+) -> u32 {
+	wait_for_fence(logical_device, draw_fence)
+	reset_fence(logical_device, draw_fence)
+
+	swap_chain_image_index: u32
+	acquire_result := vk.AcquireNextImageKHR(
+		logical_device,
+		swap_chain,
+		max(u64),
+		acquire_semaphore,
+		0,
+		&swap_chain_image_index,
+	)
+
+	assert(
+		acquire_result == .SUCCESS ||
+		acquire_result == .SUBOPTIMAL_KHR ||
+		acquire_result == .ERROR_OUT_OF_DATE_KHR,
+		"failed to acquire next image",
+	)
+
+	return swap_chain_image_index
+}
 
 // ---------------------------------------------------------------- VULKAN SETUP
 
@@ -976,6 +1046,67 @@ record_command_buffer :: proc(
 	end_command_buffer(command_buffer)
 }
 
+submit_command_buffer :: proc(
+	logical_device: vk.Device,
+	command_buffer: vk.CommandBuffer,
+	draw_fence: vk.Fence,
+	acquire_semaphore: vk.Semaphore,
+	render_finish_semaphore: vk.Semaphore,
+	graphics_queue: vk.Queue,
+) {
+	acquire_semaphore := acquire_semaphore
+	command_buffer := command_buffer
+	render_finish_semaphore := render_finish_semaphore
+
+	wait_dst_stage_mask := vk.PipelineStageFlags{.COLOR_ATTACHMENT_OUTPUT}
+
+	submit_i := vk.SubmitInfo {
+		sType                = .SUBMIT_INFO,
+		waitSemaphoreCount   = 1,
+		pWaitSemaphores      = &acquire_semaphore,
+		pWaitDstStageMask    = &wait_dst_stage_mask,
+		commandBufferCount   = 1,
+		pCommandBuffers      = &command_buffer,
+		signalSemaphoreCount = 1,
+		pSignalSemaphores    = &render_finish_semaphore,
+	}
+
+	submit_result := vk.QueueSubmit(graphics_queue, 1, &submit_i, draw_fence)
+	assert(submit_result == .SUCCESS, "failed to submit command buffer")
+}
+
+queue_present :: proc(
+	logical_device: vk.Device,
+	swap_chain: vk.SwapchainKHR,
+	render_finish_semaphore: vk.Semaphore,
+	graphics_queue: vk.Queue,
+	swap_chain_image_index: u32,
+) {
+	swap_chain := swap_chain
+	render_finish_semaphore := render_finish_semaphore
+	swap_chain_image_index := swap_chain_image_index
+
+	present_i := vk.PresentInfoKHR {
+		sType              = .PRESENT_INFO_KHR,
+		swapchainCount     = 1,
+		pSwapchains        = &swap_chain,
+		waitSemaphoreCount = 1,
+		pWaitSemaphores    = &render_finish_semaphore,
+		pImageIndices      = &swap_chain_image_index,
+	}
+
+	present_result := vk.QueuePresentKHR(graphics_queue, &present_i)
+	assert(
+		present_result == .SUCCESS ||
+		present_result == .SUBOPTIMAL_KHR ||
+		present_result == .ERROR_OUT_OF_DATE_KHR,
+		"failed to queue present",
+	)
+}
+
+wait_idle_device :: proc(logical_device: vk.Device) {
+	vk.DeviceWaitIdle(logical_device)
+}
 
 // ------------------------------------------------------------------------ GLFW
 
@@ -1019,12 +1150,13 @@ main :: proc() {
 	fmt.println("GLFW window created")
 
 	surface := create_surface(instance, window)
+	defer vk.DestroySurfaceKHR(instance, surface, nil)
 	fmt.println("Vulkan surface created")
 
 	physical_device := choose_physical_device(instance, surface)
 	fmt.println("Vulkan physical device picked")
 
-	logical_device, _ := create_logical_device(physical_device, surface)
+	logical_device, graphics_queue := create_logical_device(physical_device, surface)
 	defer vk.DestroyDevice(logical_device, nil)
 	fmt.println("Vulkan logical device created")
 
@@ -1072,6 +1204,7 @@ main :: proc() {
 		swap_chain_format,
 	)
 	defer vk.DestroyPipelineLayout(logical_device, pipeline_layout, nil)
+	defer vk.DestroyPipeline(logical_device, graphics_pipeline, nil)
 	fmt.println("Vulkan pipeline layout created")
 
 	command_pool := create_command_pool(logical_device, physical_device)
@@ -1081,14 +1214,28 @@ main :: proc() {
 	command_buffer := create_command_buffer(logical_device, command_pool)
 	fmt.println("Vulkan command buffer created")
 
-	record_command_buffer(
-		command_buffer,
-		swap_chain_images[0],
-		swap_chain_image_views[0],
-		swap_chain_extent,
-		graphics_pipeline,
-	)
-	fmt.println("command buffer recorded")
+	acquire_semaphore := create_semaphore(logical_device)
+	defer vk.DestroySemaphore(logical_device, acquire_semaphore, nil)
+	fmt.println("acquire semaphore created")
+
+	submit_semaphores := make([]vk.Semaphore, len(swap_chain_images))
+	defer delete(submit_semaphores)
+
+	for i in 0 ..< len(submit_semaphores) {
+		submit_semaphores[i] = create_semaphore(logical_device)
+	}
+
+	defer {
+		for i in 0 ..< len(submit_semaphores) {
+			vk.DestroySemaphore(logical_device, submit_semaphores[i], nil)
+		}
+	}
+
+	fmt.println("submit semaphores created")
+
+	draw_fence := create_fence(logical_device)
+	defer vk.DestroyFence(logical_device, draw_fence, nil)
+	fmt.println("draw fence created")
 
 	key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action, mods: i32) {
 		if key == glfw.KEY_ESCAPE {
@@ -1100,5 +1247,39 @@ main :: proc() {
 
 	for !glfw.WindowShouldClose(window.handle) && is_running {
 		glfw.PollEvents()
+
+		swap_chain_image_index := acquire_next_image(
+			logical_device,
+			swap_chain,
+			draw_fence,
+			acquire_semaphore,
+		)
+
+		record_command_buffer(
+			command_buffer,
+			swap_chain_images[swap_chain_image_index],
+			swap_chain_image_views[swap_chain_image_index],
+			swap_chain_extent,
+			graphics_pipeline,
+		)
+
+		submit_command_buffer(
+			logical_device,
+			command_buffer,
+			draw_fence,
+			acquire_semaphore,
+			submit_semaphores[swap_chain_image_index],
+			graphics_queue,
+		)
+
+		queue_present(
+			logical_device,
+			swap_chain,
+			submit_semaphores[swap_chain_image_index],
+			graphics_queue,
+			swap_chain_image_index,
+		)
 	}
+
+	wait_idle_device(logical_device)
 }
