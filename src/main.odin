@@ -14,6 +14,7 @@ VK_DEBUG_MESSENGER: vk.DebugUtilsMessengerEXT = {}
 VK_DEBUG_LEVEL: vk.DebugUtilsMessageSeverityFlagsEXT = {.WARNING, .ERROR}
 VK_VALIDATION_LAYERS := []cstring{"VK_LAYER_KHRONOS_validation"}
 VK_REQUIRED_EXTENSIONS := []cstring{vk.KHR_SWAPCHAIN_EXTENSION_NAME}
+VK_NUM_FRAMES_IN_FLIGHT :: 2
 
 // ---------------------------------------------------------------- VULKAN UTILS
 
@@ -373,6 +374,27 @@ create_command_buffer :: proc(
 	return command_buffers[0]
 }
 
+create_command_buffers :: proc(
+	logical_device: vk.Device,
+	command_pool: vk.CommandPool,
+	command_buffers: []vk.CommandBuffer,
+) {
+	allocation_i := vk.CommandBufferAllocateInfo {
+		sType              = .COMMAND_BUFFER_ALLOCATE_INFO,
+		commandPool        = command_pool,
+		level              = .PRIMARY,
+		commandBufferCount = u32(len(command_buffers)),
+	}
+
+	command_buffers_result := vk.AllocateCommandBuffers(
+		logical_device,
+		&allocation_i,
+		raw_data(command_buffers),
+	)
+
+	assert(command_buffers_result == .SUCCESS, "failed to create command buffers")
+}
+
 begin_command_buffer :: proc(command_buffer: vk.CommandBuffer) {
 	begin_i := vk.CommandBufferBeginInfo {
 		sType            = .COMMAND_BUFFER_BEGIN_INFO,
@@ -500,6 +522,12 @@ create_semaphore :: proc(logical_device: vk.Device) -> vk.Semaphore {
 	return semaphore
 }
 
+create_semaphores :: proc(logical_device: vk.Device, semaphores: []vk.Semaphore) {
+	for i in 0 ..< len(semaphores) {
+		semaphores[i] = create_semaphore(logical_device)
+	}
+}
+
 create_fence :: proc(logical_device: vk.Device) -> vk.Fence {
 	fence_ci := vk.FenceCreateInfo {
 		sType = .FENCE_CREATE_INFO,
@@ -511,6 +539,12 @@ create_fence :: proc(logical_device: vk.Device) -> vk.Fence {
 	assert(fence_result == .SUCCESS, "failed to create fence")
 
 	return fence
+}
+
+create_fences :: proc(logical_device: vk.Device, fences: []vk.Fence) {
+	for i in 0 ..< len(fences) {
+		fences[i] = create_fence(logical_device)
+	}
 }
 
 wait_for_fence :: proc(logical_device: vk.Device, fence: vk.Fence) {
@@ -1211,31 +1245,43 @@ main :: proc() {
 	defer vk.DestroyCommandPool(logical_device, command_pool, nil)
 	fmt.println("Vulkan command pool created")
 
-	command_buffer := create_command_buffer(logical_device, command_pool)
-	fmt.println("Vulkan command buffer created")
+	command_buffers: [VK_NUM_FRAMES_IN_FLIGHT]vk.CommandBuffer
+	create_command_buffers(logical_device, command_pool, command_buffers[:])
+	fmt.println("Vulkan command buffers created")
 
-	acquire_semaphore := create_semaphore(logical_device)
-	defer vk.DestroySemaphore(logical_device, acquire_semaphore, nil)
-	fmt.println("acquire semaphore created")
-
-	submit_semaphores := make([]vk.Semaphore, len(swap_chain_images))
-	defer delete(submit_semaphores)
-
-	for i in 0 ..< len(submit_semaphores) {
-		submit_semaphores[i] = create_semaphore(logical_device)
-	}
+	acquire_semaphores: [VK_NUM_FRAMES_IN_FLIGHT]vk.Semaphore
+	create_semaphores(logical_device, acquire_semaphores[:])
 
 	defer {
-		for i in 0 ..< len(submit_semaphores) {
-			vk.DestroySemaphore(logical_device, submit_semaphores[i], nil)
+		for semaphore in acquire_semaphores {
+			vk.DestroySemaphore(logical_device, semaphore, nil)
 		}
 	}
 
-	fmt.println("submit semaphores created")
+	fmt.println("Vulkan acquire semaphores created")
 
-	draw_fence := create_fence(logical_device)
-	defer vk.DestroyFence(logical_device, draw_fence, nil)
-	fmt.println("draw fence created")
+	submit_semaphores := make([]vk.Semaphore, len(swap_chain_images))
+	create_semaphores(logical_device, submit_semaphores)
+	defer delete(submit_semaphores)
+
+	defer {
+		for semaphore in submit_semaphores {
+			vk.DestroySemaphore(logical_device, semaphore, nil)
+		}
+	}
+
+	fmt.println("Vulkan submit semaphores created")
+
+	draw_fences: [VK_NUM_FRAMES_IN_FLIGHT]vk.Fence
+	create_fences(logical_device, draw_fences[:])
+
+	defer {
+		for fence in draw_fences {
+			vk.DestroyFence(logical_device, fence, nil)
+		}
+	}
+
+	fmt.println("Vulkan draw fences created")
 
 	key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action, mods: i32) {
 		if key == glfw.KEY_ESCAPE {
@@ -1245,18 +1291,19 @@ main :: proc() {
 
 	glfw.SetKeyCallback(window.handle, key_callback)
 
+	frame_index: u32 = 0
 	for !glfw.WindowShouldClose(window.handle) && is_running {
 		glfw.PollEvents()
 
 		swap_chain_image_index := acquire_next_image(
 			logical_device,
 			swap_chain,
-			draw_fence,
-			acquire_semaphore,
+			draw_fences[frame_index],
+			acquire_semaphores[frame_index],
 		)
 
 		record_command_buffer(
-			command_buffer,
+			command_buffers[frame_index],
 			swap_chain_images[swap_chain_image_index],
 			swap_chain_image_views[swap_chain_image_index],
 			swap_chain_extent,
@@ -1265,9 +1312,9 @@ main :: proc() {
 
 		submit_command_buffer(
 			logical_device,
-			command_buffer,
-			draw_fence,
-			acquire_semaphore,
+			command_buffers[frame_index],
+			draw_fences[frame_index],
+			acquire_semaphores[frame_index],
 			submit_semaphores[swap_chain_image_index],
 			graphics_queue,
 		)
@@ -1279,6 +1326,8 @@ main :: proc() {
 			graphics_queue,
 			swap_chain_image_index,
 		)
+
+		frame_index = (frame_index + 1) % VK_NUM_FRAMES_IN_FLIGHT
 	}
 
 	wait_idle_device(logical_device)
