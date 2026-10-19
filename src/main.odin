@@ -8,7 +8,7 @@ import "core:strings"
 import "vendor:glfw"
 import vk "vendor:vulkan"
 
-// ------------------------------------------------------------------- CONSTANTS
+// >------------------------------------------------------------------ CONSTANTS
 
 VK_DEBUG_MESSENGER: vk.DebugUtilsMessengerEXT = {}
 VK_DEBUG_LEVEL: vk.DebugUtilsMessageSeverityFlagsEXT = {.WARNING, .ERROR}
@@ -16,7 +16,8 @@ VK_VALIDATION_LAYERS := []cstring{"VK_LAYER_KHRONOS_validation"}
 VK_REQUIRED_EXTENSIONS := []cstring{vk.KHR_SWAPCHAIN_EXTENSION_NAME}
 VK_NUM_FRAMES_IN_FLIGHT :: 2
 
-// ---------------------------------------------------------------- VULKAN UTILS
+
+// >--------------------------------------------------------------- VULKAN UTILS
 
 check_layer_support :: proc(required_layers: []cstring) -> bool {
 	layer_count: u32
@@ -559,36 +560,74 @@ reset_fence :: proc(logical_device: vk.Device, fence: vk.Fence) {
 	assert(fence_result == .SUCCESS, "failed to wait for fence")
 }
 
+Acquire_Flag :: enum {
+	Acquired, // An image was acquired and must be drawn and presented
+	Needs_Recreation, // The swap chain no longer matches the surface
+}
+
+Acquire_Flags :: bit_set[Acquire_Flag]
+
 acquire_next_image :: proc(
 	logical_device: vk.Device,
 	swap_chain: vk.SwapchainKHR,
 	draw_fence: vk.Fence,
 	acquire_semaphore: vk.Semaphore,
-) -> u32 {
+) -> (
+	image_index: u32,
+	flags: Acquire_Flags,
+) {
 	wait_for_fence(logical_device, draw_fence)
-	reset_fence(logical_device, draw_fence)
 
-	swap_chain_image_index: u32
-	acquire_result := vk.AcquireNextImageKHR(
+	result := vk.AcquireNextImageKHR(
 		logical_device,
 		swap_chain,
 		max(u64),
 		acquire_semaphore,
 		0,
-		&swap_chain_image_index,
+		&image_index,
 	)
 
-	assert(
-		acquire_result == .SUCCESS ||
-		acquire_result == .SUBOPTIMAL_KHR ||
-		acquire_result == .ERROR_OUT_OF_DATE_KHR,
-		"failed to acquire next image",
-	)
+	#partial switch result {
+	case .SUCCESS:
+		return image_index, {.Acquired}
+	case .SUBOPTIMAL_KHR:
+		// The image is still valid: draw it, then recreate
+		return image_index, {.Acquired, .Needs_Recreation}
+	case .ERROR_OUT_OF_DATE_KHR:
+		// No image was acquired
+		return 0, {.Needs_Recreation}
+	}
 
-	return swap_chain_image_index
+	panic("failed to acquire next image")
 }
 
-// ---------------------------------------------------------------- VULKAN SETUP
+destroy_swap_chain :: proc(logical_device: vk.Device, swap_chain: vk.SwapchainKHR) {
+	if swap_chain != 0 {
+		vk.DestroySwapchainKHR(logical_device, swap_chain, nil)
+	}
+}
+
+destroy_swap_chain_images :: proc(logical_device: vk.Device, swap_chain_images: []vk.Image) {
+	if swap_chain_images != nil {
+		delete(swap_chain_images)
+	}
+}
+
+
+destroy_swap_chain_image_views :: proc(
+	logical_device: vk.Device,
+	swap_chain_image_views: []vk.ImageView,
+) {
+	if swap_chain_image_views != nil {
+		for image_view in swap_chain_image_views {
+			vk.DestroyImageView(logical_device, image_view, nil)
+		}
+
+		delete(swap_chain_image_views)
+	}
+}
+
+// >--------------------------------------------------------------- VULKAN SETUP
 
 
 create_instance :: proc() -> vk.Instance {
@@ -1115,7 +1154,7 @@ queue_present :: proc(
 	render_finish_semaphore: vk.Semaphore,
 	graphics_queue: vk.Queue,
 	swap_chain_image_index: u32,
-) {
+) -> bool {
 	swap_chain := swap_chain
 	render_finish_semaphore := render_finish_semaphore
 	swap_chain_image_index := swap_chain_image_index
@@ -1130,19 +1169,21 @@ queue_present :: proc(
 	}
 
 	present_result := vk.QueuePresentKHR(graphics_queue, &present_i)
-	assert(
-		present_result == .SUCCESS ||
-		present_result == .SUBOPTIMAL_KHR ||
-		present_result == .ERROR_OUT_OF_DATE_KHR,
-		"failed to queue present",
-	)
+
+
+	if present_result == .SUBOPTIMAL_KHR || present_result == .ERROR_OUT_OF_DATE_KHR {
+		return true
+	}
+
+	assert(present_result == .SUCCESS, "failed to queue present")
+	return false
 }
 
 wait_idle_device :: proc(logical_device: vk.Device) {
 	vk.DeviceWaitIdle(logical_device)
 }
 
-// ------------------------------------------------------------------------ GLFW
+// >----------------------------------------------------------------------- GLFW
 
 init_glfw :: proc() {
 	result := glfw.Init()
@@ -1156,7 +1197,7 @@ Window :: struct {
 }
 
 create_window :: proc(width: u32, height: u32) -> Window {
-	glfw.WindowHint(glfw.RESIZABLE, 0)
+	glfw.WindowHint(glfw.RESIZABLE, 1)
 	glfw.WindowHint(glfw.CLIENT_API, glfw.NO_API)
 
 	handle := glfw.CreateWindow(i32(width), i32(height), "Vulkan Tutorial Odin", nil, nil)
@@ -1165,9 +1206,10 @@ create_window :: proc(width: u32, height: u32) -> Window {
 	return Window{handle = handle, width = width, height = height}
 }
 
-// ----------------------------------------------------------------- APPLICATION
+// >---------------------------------------------------------------- APPLICATION
 
-is_running := true
+is_running: bool = true
+is_frambuffer_resized: bool = false
 
 main :: proc() {
 	init_glfw()
@@ -1291,41 +1333,98 @@ main :: proc() {
 
 	glfw.SetKeyCallback(window.handle, key_callback)
 
+	framebuffer_resize_callback :: proc "c" (window: glfw.WindowHandle, width: i32, height: i32) {
+		is_frambuffer_resized = true
+	}
+
+	glfw.SetFramebufferSizeCallback(window.handle, framebuffer_resize_callback)
+
 	frame_index: u32 = 0
 	for !glfw.WindowShouldClose(window.handle) && is_running {
 		glfw.PollEvents()
 
-		swap_chain_image_index := acquire_next_image(
+		swap_chain_image_index, acquire_flags := acquire_next_image(
 			logical_device,
 			swap_chain,
 			draw_fences[frame_index],
 			acquire_semaphores[frame_index],
 		)
 
-		record_command_buffer(
-			command_buffers[frame_index],
-			swap_chain_images[swap_chain_image_index],
-			swap_chain_image_views[swap_chain_image_index],
-			swap_chain_extent,
-			graphics_pipeline,
-		)
+		is_swap_chain_recreation_needed := .Needs_Recreation in acquire_flags
 
-		submit_command_buffer(
-			logical_device,
-			command_buffers[frame_index],
-			draw_fences[frame_index],
-			acquire_semaphores[frame_index],
-			submit_semaphores[swap_chain_image_index],
-			graphics_queue,
-		)
+		if .Acquired in acquire_flags {
+			// Only reset once we know a submit will signal it again
+			reset_fence(logical_device, draw_fences[frame_index])
 
-		queue_present(
-			logical_device,
-			swap_chain,
-			submit_semaphores[swap_chain_image_index],
-			graphics_queue,
-			swap_chain_image_index,
-		)
+			record_command_buffer(
+				command_buffers[frame_index],
+				swap_chain_images[swap_chain_image_index],
+				swap_chain_image_views[swap_chain_image_index],
+				swap_chain_extent,
+				graphics_pipeline,
+			)
+
+			submit_command_buffer(
+				logical_device,
+				command_buffers[frame_index],
+				draw_fences[frame_index],
+				acquire_semaphores[frame_index],
+				submit_semaphores[swap_chain_image_index],
+				graphics_queue,
+			)
+
+			is_swap_chain_recreation_needed |= queue_present(
+				logical_device,
+				swap_chain,
+				submit_semaphores[swap_chain_image_index],
+				graphics_queue,
+				swap_chain_image_index,
+			)
+		}
+
+		if is_swap_chain_recreation_needed || is_frambuffer_resized {
+			width, height := glfw.GetFramebufferSize(window.handle)
+			for width == 0 && height == 0 {
+				glfw.WaitEvents()
+				width, height = glfw.GetFramebufferSize(window.handle)
+			}
+
+			window.width = u32(width)
+			window.height = u32(height)
+
+			is_frambuffer_resized = false
+			wait_idle_device(logical_device)
+
+			destroy_swap_chain_image_views(logical_device, swap_chain_image_views)
+			destroy_swap_chain_images(logical_device, swap_chain_images)
+			destroy_swap_chain(logical_device, swap_chain)
+
+			swap_chain, swap_chain_format, swap_chain_extent = create_swap_chain(
+				physical_device,
+				logical_device,
+				surface,
+				window,
+			)
+
+			swap_chain_images = get_swap_chain_images(logical_device, swap_chain)
+			swap_chain_image_views = create_image_views(
+				logical_device,
+				swap_chain_images,
+				swap_chain_format,
+			)
+
+			for semaphore in submit_semaphores {
+				vk.DestroySemaphore(logical_device, semaphore, nil)
+			}
+
+			delete(submit_semaphores)
+
+			submit_semaphores = make([]vk.Semaphore, len(swap_chain_images))
+			create_semaphores(logical_device, submit_semaphores)
+
+			fmt.println("Vulkan swap chain crecreated")
+		}
+
 
 		frame_index = (frame_index + 1) % VK_NUM_FRAMES_IN_FLIGHT
 	}
