@@ -2,6 +2,7 @@ package main
 
 import "base:runtime"
 import "core:fmt"
+import "core:mem"
 import "core:os"
 import "core:slice"
 import "core:strings"
@@ -16,6 +17,15 @@ VK_VALIDATION_LAYERS := []cstring{"VK_LAYER_KHRONOS_validation"}
 VK_REQUIRED_EXTENSIONS := []cstring{vk.KHR_SWAPCHAIN_EXTENSION_NAME}
 VK_NUM_FRAMES_IN_FLIGHT :: 2
 
+// >---------------------------------------------------------------------- TYPES
+
+vec2 :: [2]f32
+vec3 :: [3]f32
+
+Vertex :: struct {
+	pos:   vec2,
+	color: vec3,
+}
 
 // >--------------------------------------------------------------- VULKAN UTILS
 
@@ -930,8 +940,6 @@ create_graphics_pipeline :: proc(
 		},
 	}
 
-	// What can be dynamic in the pipeline.
-	// What things can be mutated without creating a new pipeline.
 	dynamic_states := []vk.DynamicState{.VIEWPORT, .SCISSOR}
 	dynamic_state_ci := vk.PipelineDynamicStateCreateInfo {
 		sType             = .PIPELINE_DYNAMIC_STATE_CREATE_INFO,
@@ -939,26 +947,41 @@ create_graphics_pipeline :: proc(
 		pDynamicStates    = raw_data(dynamic_states),
 	}
 
-	// Vertex input.
-	// Configure the data format of vertices.
-	// For now the vertices are hardcoded in shaders themselves.
-	vertex_input_ci := vk.PipelineVertexInputStateCreateInfo {
-		sType                           = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-		vertexBindingDescriptionCount   = 0,
-		pVertexBindingDescriptions      = nil,
-		vertexAttributeDescriptionCount = 0,
-		pVertexAttributeDescriptions    = nil,
+	vertex_binding_description := vk.VertexInputBindingDescription {
+		binding   = 0,
+		stride    = size_of(Vertex),
+		inputRate = .VERTEX,
 	}
 
-	// Input assembly.
-	// Configure topology.
+	vertex_attribute_description := []vk.VertexInputAttributeDescription {
+		{
+			location = 0,
+			binding  = 0,
+			format   = .R32G32_SFLOAT,
+			offset   = u32(offset_of(Vertex, pos)),
+		},
+		{
+			location = 1,
+			binding  = 0,
+			format   = .R32G32B32_SFLOAT,
+			offset   = u32(offset_of(Vertex, color)),
+		},
+	}
+
+	vertex_input_ci := vk.PipelineVertexInputStateCreateInfo {
+		sType                           = .PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+		vertexBindingDescriptionCount   = 1,
+		pVertexBindingDescriptions      = &vertex_binding_description,
+		vertexAttributeDescriptionCount = u32(len(vertex_attribute_description)),
+		pVertexAttributeDescriptions    = raw_data(vertex_attribute_description),
+	}
+
 	input_assembly_ci := vk.PipelineInputAssemblyStateCreateInfo {
 		sType                  = .PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
 		topology               = .TRIANGLE_LIST,
 		primitiveRestartEnable = false,
 	}
 
-	// These are dynamic as set previously.
 	viewport_state_ci := vk.PipelineViewportStateCreateInfo {
 		sType         = .PIPELINE_VIEWPORT_STATE_CREATE_INFO,
 		viewportCount = 1,
@@ -1067,6 +1090,7 @@ record_command_buffer :: proc(
 	image_view: vk.ImageView,
 	swap_chain_extent: vk.Extent2D,
 	graphics_pipeline: vk.Pipeline,
+	vertex_buffer: vk.Buffer,
 ) {
 
 	// Begin to start the recording...
@@ -1095,6 +1119,11 @@ record_command_buffer :: proc(
 
 	// Set scissor
 	set_scissor(command_buffer, swap_chain_extent)
+
+	// Bind vertex buffer to binding 0
+	offsets := vk.DeviceSize(0)
+	vertex_buffer := vertex_buffer
+	vk.CmdBindVertexBuffers(command_buffer, 0, 1, &vertex_buffer, &offsets)
 
 	// Draw 3 vertices
 	vk.CmdDraw(command_buffer, 3, 1, 0, 0)
@@ -1181,6 +1210,99 @@ queue_present :: proc(
 
 wait_idle_device :: proc(logical_device: vk.Device) {
 	vk.DeviceWaitIdle(logical_device)
+}
+
+create_buffer :: proc(
+	physical_device: vk.PhysicalDevice,
+	logical_device: vk.Device,
+	size: u64,
+	usage_flags: vk.BufferUsageFlags,
+	property_flags: vk.MemoryPropertyFlags,
+) -> (
+	vk.Buffer,
+	vk.DeviceMemory,
+) {
+	buffer_ci := vk.BufferCreateInfo {
+		sType       = .BUFFER_CREATE_INFO,
+		size        = vk.DeviceSize(size),
+		usage       = usage_flags,
+		sharingMode = .EXCLUSIVE,
+	}
+
+	buffer: vk.Buffer
+	buffer_result := vk.CreateBuffer(logical_device, &buffer_ci, nil, &buffer)
+	assert(buffer_result == .SUCCESS, "failed to create buffer")
+
+	memory_requirenments: vk.MemoryRequirements
+	vk.GetBufferMemoryRequirements(logical_device, buffer, &memory_requirenments)
+
+	memory_type_index, ok := find_memory_type(
+		physical_device,
+		memory_requirenments.memoryTypeBits,
+		property_flags,
+	)
+
+	assert(ok, "failed to find memory type")
+
+	allocation_i := vk.MemoryAllocateInfo {
+		sType           = .MEMORY_ALLOCATE_INFO,
+		allocationSize  = memory_requirenments.size,
+		memoryTypeIndex = memory_type_index,
+	}
+
+	buffer_memory: vk.DeviceMemory
+	allocate_result := vk.AllocateMemory(logical_device, &allocation_i, nil, &buffer_memory)
+	assert(allocate_result == .SUCCESS, "failed to allocate buffer memory")
+
+	bind_result := vk.BindBufferMemory(logical_device, buffer, buffer_memory, 0)
+	assert(bind_result == .SUCCESS, "failed to bind buffer memory")
+
+	return buffer, buffer_memory
+}
+
+
+find_memory_type :: proc(
+	physical_device: vk.PhysicalDevice,
+	type_filter: u32,
+	properties: vk.MemoryPropertyFlags,
+) -> (
+	u32,
+	bool,
+) {
+	mem_properties: vk.PhysicalDeviceMemoryProperties
+	vk.GetPhysicalDeviceMemoryProperties(physical_device, &mem_properties)
+
+	for i in 0 ..< mem_properties.memoryTypeCount {
+		if (type_filter & (1 << i)) != 0 &&
+		   (mem_properties.memoryTypes[i].propertyFlags & properties) == properties {
+			return i, true
+		}
+	}
+
+
+	return 0, false
+}
+
+memory_copy_to_buffer :: proc(
+	logical_device: vk.Device,
+	buffer_memory: vk.DeviceMemory,
+	data: []$T,
+) {
+	size := size_of(T) * len(data)
+	dest_data: rawptr
+
+	map_result := vk.MapMemory(
+		logical_device,
+		buffer_memory,
+		0,
+		vk.DeviceSize(size),
+		{},
+		&dest_data,
+	)
+
+	assert(map_result == .SUCCESS, "failed to map memory")
+	mem.copy(dest_data, raw_data(data), size)
+	vk.UnmapMemory(logical_device, buffer_memory)
 }
 
 // >----------------------------------------------------------------------- GLFW
@@ -1325,6 +1447,29 @@ main :: proc() {
 
 	fmt.println("Vulkan draw fences created")
 
+	vertices := []Vertex{
+        {pos = {0.0, -0.5}, color = {1.0, 0.0, 0.0}},
+        {pos = {0.5, 0.5}, color = {0.0, 1.0, 0.0}},
+        {pos = {-0.5, 0.5}, color= {0.0, 0.0, 1.0}},
+    }
+
+    vertex_buffer, vertex_buffer_memory := create_buffer(
+		physical_device,
+		logical_device,
+		u64(size_of(Vertex) * len(vertices)),
+		{.VERTEX_BUFFER},
+		{.HOST_VISIBLE, .HOST_COHERENT},
+	)
+
+	memory_copy_to_buffer(logical_device, vertex_buffer_memory, vertices)
+
+	defer {
+		vk.DestroyBuffer(logical_device, vertex_buffer, nil)
+		vk.FreeMemory(logical_device, vertex_buffer_memory, nil)
+	}
+
+	fmt.println("Vulkan vertex buffer allocated and created")
+
 	key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action, mods: i32) {
 		if key == glfw.KEY_ESCAPE {
 			is_running = false
@@ -1362,6 +1507,7 @@ main :: proc() {
 				swap_chain_image_views[swap_chain_image_index],
 				swap_chain_extent,
 				graphics_pipeline,
+				vertex_buffer,
 			)
 
 			submit_command_buffer(
