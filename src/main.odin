@@ -406,10 +406,13 @@ create_command_buffers :: proc(
 	assert(command_buffers_result == .SUCCESS, "failed to create command buffers")
 }
 
-begin_command_buffer :: proc(command_buffer: vk.CommandBuffer) {
+begin_command_buffer :: proc(
+	command_buffer: vk.CommandBuffer,
+	flags: vk.CommandBufferUsageFlags = {},
+) {
 	begin_i := vk.CommandBufferBeginInfo {
 		sType            = .COMMAND_BUFFER_BEGIN_INFO,
-		flags            = {},
+		flags            = flags,
 		pInheritanceInfo = nil,
 	}
 
@@ -635,6 +638,59 @@ destroy_swap_chain_image_views :: proc(
 
 		delete(swap_chain_image_views)
 	}
+}
+
+transfer_to_buffer :: proc(
+	physical_device: vk.PhysicalDevice,
+	logical_device: vk.Device,
+	queue: vk.Queue,
+	data: []$T,
+	dest: vk.Buffer,
+) {
+	size := u64(len(data) * size_of(T))
+
+	staging_buffer, staging_buffer_memory := create_buffer(
+		physical_device,
+		logical_device,
+		size,
+		{.TRANSFER_SRC},
+		{.HOST_VISIBLE, .HOST_COHERENT},
+	)
+
+	defer vk.DestroyBuffer(logical_device, staging_buffer, nil)
+	defer vk.FreeMemory(logical_device, staging_buffer_memory, nil)
+
+	memory_copy_to_buffer(logical_device, staging_buffer_memory, data)
+
+	command_pool := create_command_pool(logical_device, physical_device)
+	defer vk.DestroyCommandPool(logical_device, command_pool, nil)
+
+	command_buffers: [1]vk.CommandBuffer
+	create_command_buffers(logical_device, command_pool, command_buffers[:])
+	command_buffer := command_buffers[0]
+
+	begin_command_buffer(command_buffer, {.ONE_TIME_SUBMIT})
+
+	copy_region := vk.BufferCopy {
+		srcOffset = 0,
+		dstOffset = 0,
+		size      = vk.DeviceSize(size),
+	}
+
+	vk.CmdCopyBuffer(command_buffer, staging_buffer, dest, 1, &copy_region)
+	end_command_buffer(command_buffer)
+
+	submit_i := vk.SubmitInfo {
+		sType              = .SUBMIT_INFO,
+		commandBufferCount = 1,
+		pCommandBuffers    = &command_buffer,
+	}
+
+	submit_result := vk.QueueSubmit(queue, 1, &submit_i, 0)
+	assert(submit_result == .SUCCESS, "failed to submit queue")
+
+	wait_result := vk.QueueWaitIdle(queue)
+	assert(wait_result == .SUCCESS, "failed to wait for queue idle")
 }
 
 // >--------------------------------------------------------------- VULKAN SETUP
@@ -954,17 +1010,12 @@ create_graphics_pipeline :: proc(
 	}
 
 	vertex_attribute_description := []vk.VertexInputAttributeDescription {
-		{
-			location = 0,
-			binding  = 0,
-			format   = .R32G32_SFLOAT,
-			offset   = u32(offset_of(Vertex, pos)),
-		},
+		{location = 0, binding = 0, format = .R32G32_SFLOAT, offset = u32(offset_of(Vertex, pos))},
 		{
 			location = 1,
-			binding  = 0,
-			format   = .R32G32B32_SFLOAT,
-			offset   = u32(offset_of(Vertex, color)),
+			binding = 0,
+			format = .R32G32B32_SFLOAT,
+			offset = u32(offset_of(Vertex, color)),
 		},
 	}
 
@@ -1447,21 +1498,21 @@ main :: proc() {
 
 	fmt.println("Vulkan draw fences created")
 
-	vertices := []Vertex{
-        {pos = {0.0, -0.5}, color = {1.0, 0.0, 0.0}},
-        {pos = {0.5, 0.5}, color = {0.0, 1.0, 0.0}},
-        {pos = {-0.5, 0.5}, color= {0.0, 0.0, 1.0}},
-    }
+	vertices := []Vertex {
+		{pos = {0.0, -0.5}, color = {1.0, 0.0, 0.0}},
+		{pos = {0.5, 0.5}, color = {0.0, 1.0, 0.0}},
+		{pos = {-0.5, 0.5}, color = {0.0, 0.0, 1.0}},
+	}
 
-    vertex_buffer, vertex_buffer_memory := create_buffer(
+	vertex_buffer, vertex_buffer_memory := create_buffer(
 		physical_device,
 		logical_device,
 		u64(size_of(Vertex) * len(vertices)),
-		{.VERTEX_BUFFER},
-		{.HOST_VISIBLE, .HOST_COHERENT},
+		{.VERTEX_BUFFER, .TRANSFER_DST},
+		{.DEVICE_LOCAL},
 	)
 
-	memory_copy_to_buffer(logical_device, vertex_buffer_memory, vertices)
+	transfer_to_buffer(physical_device, logical_device, graphics_queue, vertices, vertex_buffer)
 
 	defer {
 		vk.DestroyBuffer(logical_device, vertex_buffer, nil)
