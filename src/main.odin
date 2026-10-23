@@ -1142,6 +1142,8 @@ record_command_buffer :: proc(
 	swap_chain_extent: vk.Extent2D,
 	graphics_pipeline: vk.Pipeline,
 	vertex_buffer: vk.Buffer,
+	index_buffer: vk.Buffer,
+	index_count: u32,
 ) {
 
 	// Begin to start the recording...
@@ -1176,8 +1178,12 @@ record_command_buffer :: proc(
 	vertex_buffer := vertex_buffer
 	vk.CmdBindVertexBuffers(command_buffer, 0, 1, &vertex_buffer, &offsets)
 
-	// Draw 3 vertices
-	vk.CmdDraw(command_buffer, 3, 1, 0, 0)
+	vk.CmdBindIndexBuffer(command_buffer, index_buffer, vk.DeviceSize(0), .UINT16)
+
+	// Replaced by CmdDrawIndexed
+	// vk.CmdDraw(command_buffer, 3, 1, 0, 0)
+
+	vk.CmdDrawIndexed(command_buffer, index_count, 1, 0, 0, 0)
 
 	// End the rendering
 	end_rendering(command_buffer)
@@ -1499,9 +1505,10 @@ main :: proc() {
 	fmt.println("Vulkan draw fences created")
 
 	vertices := []Vertex {
-		{pos = {0.0, -0.5}, color = {1.0, 0.0, 0.0}},
-		{pos = {0.5, 0.5}, color = {0.0, 1.0, 0.0}},
-		{pos = {-0.5, 0.5}, color = {0.0, 0.0, 1.0}},
+		{pos = {-0.5, -0.5}, color = {1.0, 0.0, 0.0}},
+		{pos = {0.5, -0.5}, color = {0.0, 1.0, 0.0}},
+		{pos = {0.5, 0.5}, color = {0.0, 0.0, 1.0}},
+		{pos = {-0.5, 0.5}, color = {1.0, 1.0, 1.0}},
 	}
 
 	vertex_buffer, vertex_buffer_memory := create_buffer(
@@ -1514,12 +1521,26 @@ main :: proc() {
 
 	transfer_to_buffer(physical_device, logical_device, graphics_queue, vertices, vertex_buffer)
 
-	defer {
-		vk.DestroyBuffer(logical_device, vertex_buffer, nil)
-		vk.FreeMemory(logical_device, vertex_buffer_memory, nil)
-	}
+	defer vk.DestroyBuffer(logical_device, vertex_buffer, nil)
+	defer vk.FreeMemory(logical_device, vertex_buffer_memory, nil)
 
 	fmt.println("Vulkan vertex buffer allocated and created")
+
+	indices := []u16{0, 1, 2, 2, 3, 0}
+	index_buffer, index_buffer_memory := create_buffer(
+		physical_device,
+		logical_device,
+		u64(size_of(u16) * len(indices)),
+		{.INDEX_BUFFER, .TRANSFER_DST},
+		{.DEVICE_LOCAL},
+	)
+
+	transfer_to_buffer(physical_device, logical_device, graphics_queue, indices, index_buffer)
+
+	defer vk.DestroyBuffer(logical_device, index_buffer, nil)
+	defer vk.FreeMemory(logical_device, index_buffer_memory, nil)
+
+	fmt.println("Vulkan index buffer allocated and created")
 
 	key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action, mods: i32) {
 		if key == glfw.KEY_ESCAPE {
@@ -1559,6 +1580,8 @@ main :: proc() {
 				swap_chain_extent,
 				graphics_pipeline,
 				vertex_buffer,
+				index_buffer,
+				u32(len(indices)),
 			)
 
 			submit_command_buffer(
