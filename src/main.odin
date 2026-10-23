@@ -2,10 +2,13 @@ package main
 
 import "base:runtime"
 import "core:fmt"
+import "core:math"
+import "core:math/linalg"
 import "core:mem"
 import "core:os"
 import "core:slice"
 import "core:strings"
+import "core:time"
 import "vendor:glfw"
 import vk "vendor:vulkan"
 
@@ -21,10 +24,17 @@ VK_NUM_FRAMES_IN_FLIGHT :: 2
 
 vec2 :: [2]f32
 vec3 :: [3]f32
+mat4 :: matrix[4, 4]f32
 
 Vertex :: struct {
 	pos:   vec2,
 	color: vec3,
+}
+
+Uniform_Buffer_Object :: struct {
+	model: mat4,
+	view:  mat4,
+	proj:  mat4,
 }
 
 // >--------------------------------------------------------------- VULKAN UTILS
@@ -692,7 +702,6 @@ transfer_to_buffer :: proc(
 	wait_result := vk.QueueWaitIdle(queue)
 	assert(wait_result == .SUCCESS, "failed to wait for queue idle")
 }
-
 // >--------------------------------------------------------------- VULKAN SETUP
 
 
@@ -971,6 +980,7 @@ create_graphics_pipeline :: proc(
 	vertex_entry: string,
 	fragment_entry: string,
 	swap_chain_format: vk.Format,
+	descriptor_set_layout: vk.DescriptorSetLayout,
 ) -> (
 	vk.Pipeline,
 	vk.PipelineLayout,
@@ -1045,7 +1055,7 @@ create_graphics_pipeline :: proc(
 		rasterizerDiscardEnable = false,
 		polygonMode             = .FILL,
 		cullMode                = {.BACK},
-		frontFace               = .CLOCKWISE,
+		frontFace               = .COUNTER_CLOCKWISE,
 		depthBiasEnable         = false,
 		lineWidth               = 1,
 	}
@@ -1079,10 +1089,11 @@ create_graphics_pipeline :: proc(
 		pAttachments    = &color_blend_attachment,
 	}
 
+	descriptor_set_layout := descriptor_set_layout
 	pipeline_layout_ci := vk.PipelineLayoutCreateInfo {
 		sType                  = .PIPELINE_LAYOUT_CREATE_INFO,
-		setLayoutCount         = 0,
-		pSetLayouts            = nil,
+		setLayoutCount         = 1,
+		pSetLayouts            = &descriptor_set_layout,
 		pushConstantRangeCount = 0,
 		pPushConstantRanges    = nil,
 	}
@@ -1141,9 +1152,11 @@ record_command_buffer :: proc(
 	image_view: vk.ImageView,
 	swap_chain_extent: vk.Extent2D,
 	graphics_pipeline: vk.Pipeline,
+	pipeline_layout: vk.PipelineLayout,
 	vertex_buffer: vk.Buffer,
 	index_buffer: vk.Buffer,
 	index_count: u32,
+	descriptor_set: vk.DescriptorSet
 ) {
 
 	// Begin to start the recording...
@@ -1179,6 +1192,18 @@ record_command_buffer :: proc(
 	vk.CmdBindVertexBuffers(command_buffer, 0, 1, &vertex_buffer, &offsets)
 
 	vk.CmdBindIndexBuffer(command_buffer, index_buffer, vk.DeviceSize(0), .UINT16)
+
+	descriptor_set := descriptor_set
+	vk.CmdBindDescriptorSets(
+		command_buffer,
+		.GRAPHICS,
+		pipeline_layout,
+		0,
+		1,
+		&descriptor_set,
+		0,
+		nil,
+	)
 
 	// Replaced by CmdDrawIndexed
 	// vk.CmdDraw(command_buffer, 3, 1, 0, 0)
@@ -1362,6 +1387,156 @@ memory_copy_to_buffer :: proc(
 	vk.UnmapMemory(logical_device, buffer_memory)
 }
 
+
+create_descriptor_set_layout :: proc(logical_device: vk.Device) -> vk.DescriptorSetLayout {
+	layout_binding := vk.DescriptorSetLayoutBinding {
+		binding         = 0,
+		descriptorType  = .UNIFORM_BUFFER,
+		descriptorCount = 1,
+		stageFlags      = {.VERTEX},
+	}
+
+	layout_ci := vk.DescriptorSetLayoutCreateInfo {
+		sType        = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+		bindingCount = 1,
+		pBindings    = &layout_binding,
+	}
+
+	descriptor_set_layout: vk.DescriptorSetLayout
+	descriptor_set_layout_result := vk.CreateDescriptorSetLayout(
+		logical_device,
+		&layout_ci,
+		nil,
+		&descriptor_set_layout,
+	)
+
+	assert(descriptor_set_layout_result == .SUCCESS, "failed to create descriptor set layout")
+
+	return descriptor_set_layout
+}
+
+create_descriptor_pool :: proc(
+	logical_device: vk.Device,
+	descriptor_type: vk.DescriptorType,
+	descriptor_count: u32,
+) -> vk.DescriptorPool {
+	pool_size := vk.DescriptorPoolSize {
+		type            = descriptor_type,
+		descriptorCount = descriptor_count,
+	}
+
+	pool_ci := vk.DescriptorPoolCreateInfo {
+		sType         = .DESCRIPTOR_POOL_CREATE_INFO,
+		poolSizeCount = 1,
+		pPoolSizes    = &pool_size,
+		maxSets       = descriptor_count,
+	}
+
+	descriptor_pool: vk.DescriptorPool
+	descriptor_pool_result := vk.CreateDescriptorPool(
+		logical_device,
+		&pool_ci,
+		nil,
+		&descriptor_pool,
+	)
+
+	assert(descriptor_pool_result == .SUCCESS, "failed to create descriptor pool")
+
+	return descriptor_pool
+}
+
+create_descriptor_set :: proc(
+	logical_device: vk.Device,
+	descriptor_pool: vk.DescriptorPool,
+	descriptor_layout: vk.DescriptorSetLayout,
+	descriptor_count: u32,
+) -> []vk.DescriptorSet {
+	descriptor_layouts := make([]vk.DescriptorSetLayout, descriptor_count)
+	defer delete(descriptor_layouts)
+
+	for i in 0 ..< descriptor_count {
+		descriptor_layouts[i] = descriptor_layout
+	}
+
+	allocation_i := vk.DescriptorSetAllocateInfo {
+		sType              = .DESCRIPTOR_SET_ALLOCATE_INFO,
+		descriptorPool     = descriptor_pool,
+		descriptorSetCount = descriptor_count,
+		pSetLayouts        = raw_data(descriptor_layouts),
+	}
+
+	descriptor_sets := make([]vk.DescriptorSet, descriptor_count)
+	descriptor_sets_result := vk.AllocateDescriptorSets(
+		logical_device,
+		&allocation_i,
+		raw_data(descriptor_sets),
+	)
+
+	assert(descriptor_sets_result == .SUCCESS, "failed to allocate descriptor sets")
+
+	return descriptor_sets
+}
+
+update_descriptor_set :: proc(
+	logical_device: vk.Device,
+	descriptor_set: vk.DescriptorSet,
+	uniform_buffer: vk.Buffer,
+) {
+	buffer_i := vk.DescriptorBufferInfo {
+		buffer = uniform_buffer,
+		offset = 0,
+		range  = size_of(Uniform_Buffer_Object),
+	}
+
+	write_descriptor_set := vk.WriteDescriptorSet {
+		sType           = .WRITE_DESCRIPTOR_SET,
+		dstSet          = descriptor_set,
+		dstBinding      = 0,
+		dstArrayElement = 0,
+		descriptorCount = 1,
+		descriptorType  = .UNIFORM_BUFFER,
+		pBufferInfo     = &buffer_i,
+	}
+
+	vk.UpdateDescriptorSets(logical_device, 1, &write_descriptor_set, 0, nil)
+}
+
+
+update_uniform_buffer :: proc(
+	start_time: time.Tick,
+	ubo_map_memory_ptr: rawptr,
+	swap_chain_extent: vk.Extent2D,
+) {
+	elapsed_seconds := f32(time.tick_since(start_time)) / f32(time.Second)
+
+	angle := elapsed_seconds * math.to_radians_f32(90)
+
+	width := swap_chain_extent.width
+	height := swap_chain_extent.height
+
+	if height == 0 {
+		return
+	}
+
+	aspect := f32(width) / f32(height)
+
+	ubo := Uniform_Buffer_Object {
+		model = linalg.matrix4_rotate(angle, vec3{0.0, 0.0, 1.0}),
+
+		view  = linalg.matrix4_look_at(
+			vec3{2.0, 2.0, 2.0},
+			vec3{0.0, 0.0, 0.0},
+			vec3{0.0, 0.0, 1.0},
+		),
+
+		proj  = linalg.matrix4_perspective(math.to_radians_f32(45.0), aspect, 0.1, 10.0),
+	}
+
+	ubo.proj[1, 1] *= -1
+	mapped_ubo := cast(^Uniform_Buffer_Object)ubo_map_memory_ptr
+	mapped_ubo^ = ubo
+}
+
 // >----------------------------------------------------------------------- GLFW
 
 init_glfw :: proc() {
@@ -1451,12 +1626,31 @@ main :: proc() {
 	defer vk.DestroyShaderModule(logical_device, shader_module, nil)
 	fmt.println("Vulkan shader module created")
 
+	ubo_descriptor_set_layout := create_descriptor_set_layout(logical_device)
+	defer vk.DestroyDescriptorSetLayout(logical_device, ubo_descriptor_set_layout, nil)
+
+	descriptor_pool := create_descriptor_pool(
+		logical_device,
+		.UNIFORM_BUFFER,
+		VK_NUM_FRAMES_IN_FLIGHT,
+	)
+	defer vk.DestroyDescriptorPool(logical_device, descriptor_pool, nil)
+
+	descriptor_sets := create_descriptor_set(
+		logical_device,
+		descriptor_pool,
+		ubo_descriptor_set_layout,
+		VK_NUM_FRAMES_IN_FLIGHT,
+	)
+	defer delete(descriptor_sets)
+
 	graphics_pipeline, pipeline_layout := create_graphics_pipeline(
 		logical_device,
 		shader_module,
 		"vertMain",
 		"fragMain",
 		swap_chain_format,
+		ubo_descriptor_set_layout,
 	)
 	defer vk.DestroyPipelineLayout(logical_device, pipeline_layout, nil)
 	defer vk.DestroyPipeline(logical_device, graphics_pipeline, nil)
@@ -1542,6 +1736,46 @@ main :: proc() {
 
 	fmt.println("Vulkan index buffer allocated and created")
 
+	ubo_buffers: [VK_NUM_FRAMES_IN_FLIGHT]vk.Buffer
+	ubo_buffer_memories: [VK_NUM_FRAMES_IN_FLIGHT]vk.DeviceMemory
+	ubo_map_memory_ptrs: [VK_NUM_FRAMES_IN_FLIGHT]rawptr
+
+	for i in 0 ..< VK_NUM_FRAMES_IN_FLIGHT {
+		size := u64(size_of(Uniform_Buffer_Object))
+
+		ubo_buffers[i], ubo_buffer_memories[i] = create_buffer(
+			physical_device,
+			logical_device,
+			size,
+			{.UNIFORM_BUFFER},
+			{.HOST_VISIBLE, .HOST_COHERENT},
+		)
+
+		map_memory_result := vk.MapMemory(
+			logical_device,
+			ubo_buffer_memories[i],
+			0,
+			vk.DeviceSize(size),
+			{},
+			&ubo_map_memory_ptrs[i],
+		)
+
+		assert(map_memory_result == .SUCCESS, "failed to map ubo buffer memory")
+	}
+	defer for i in 0 ..< VK_NUM_FRAMES_IN_FLIGHT {
+		vk.UnmapMemory(logical_device, ubo_buffer_memories[i])
+		vk.DestroyBuffer(logical_device, ubo_buffers[i], nil)
+		vk.FreeMemory(logical_device, ubo_buffer_memories[i], nil)
+	}
+
+	fmt.println("Vulkan uniform buffers created")
+
+	for i in 0 ..< VK_NUM_FRAMES_IN_FLIGHT {
+		update_descriptor_set(logical_device, descriptor_sets[i], ubo_buffers[i])
+	}
+
+	fmt.println("Vulkan descriptor sets updated")
+
 	key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action, mods: i32) {
 		if key == glfw.KEY_ESCAPE {
 			is_running = false
@@ -1557,6 +1791,8 @@ main :: proc() {
 	glfw.SetFramebufferSizeCallback(window.handle, framebuffer_resize_callback)
 
 	frame_index: u32 = 0
+	start_time := time.tick_now()
+
 	for !glfw.WindowShouldClose(window.handle) && is_running {
 		glfw.PollEvents()
 
@@ -1570,7 +1806,8 @@ main :: proc() {
 		is_swap_chain_recreation_needed := .Needs_Recreation in acquire_flags
 
 		if .Acquired in acquire_flags {
-			// Only reset once we know a submit will signal it again
+			update_uniform_buffer(start_time, ubo_map_memory_ptrs[frame_index], swap_chain_extent)
+
 			reset_fence(logical_device, draw_fences[frame_index])
 
 			record_command_buffer(
@@ -1579,9 +1816,11 @@ main :: proc() {
 				swap_chain_image_views[swap_chain_image_index],
 				swap_chain_extent,
 				graphics_pipeline,
+				pipeline_layout,
 				vertex_buffer,
 				index_buffer,
 				u32(len(indices)),
+				descriptor_sets[frame_index]
 			)
 
 			submit_command_buffer(
