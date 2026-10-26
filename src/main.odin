@@ -1,7 +1,10 @@
 package main
 
 import "base:runtime"
+import "core:bytes"
 import "core:fmt"
+import "core:image"
+import "core:image/jpeg"
 import "core:math"
 import "core:math/linalg"
 import "core:mem"
@@ -11,6 +14,8 @@ import "core:strings"
 import "core:time"
 import "vendor:glfw"
 import vk "vendor:vulkan"
+
+_ :: jpeg
 
 // >------------------------------------------------------------------ CONSTANTS
 
@@ -702,8 +707,40 @@ transfer_to_buffer :: proc(
 	wait_result := vk.QueueWaitIdle(queue)
 	assert(wait_result == .SUCCESS, "failed to wait for queue idle")
 }
-// >--------------------------------------------------------------- VULKAN SETUP
 
+
+transfer_buffer_to_image :: proc(
+	command_buffer: vk.CommandBuffer,
+	src_buffer: vk.Buffer,
+	dest_image: vk.Image,
+	width: u32,
+	height: u32,
+) {
+	copy_region := vk.BufferImageCopy {
+		bufferOffset = 0,
+		bufferRowLength = 0,
+		bufferImageHeight = 0,
+		imageSubresource = {
+			aspectMask = {.COLOR},
+			mipLevel = 0,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+		imageOffset = {0, 0, 0},
+		imageExtent = {width, height, 1},
+	}
+
+	vk.CmdCopyBufferToImage(
+		command_buffer,
+		src_buffer,
+		dest_image,
+		.TRANSFER_DST_OPTIMAL,
+		1,
+		&copy_region,
+	)
+}
+
+// >--------------------------------------------------------------- VULKAN SETUP
 
 create_instance :: proc() -> vk.Instance {
 	vk.load_proc_addresses(rawptr(glfw.GetInstanceProcAddress))
@@ -1156,7 +1193,7 @@ record_command_buffer :: proc(
 	vertex_buffer: vk.Buffer,
 	index_buffer: vk.Buffer,
 	index_count: u32,
-	descriptor_set: vk.DescriptorSet
+	descriptor_set: vk.DescriptorSet,
 ) {
 
 	// Begin to start the recording...
@@ -1522,19 +1559,185 @@ update_uniform_buffer :: proc(
 
 	ubo := Uniform_Buffer_Object {
 		model = linalg.matrix4_rotate(angle, vec3{0.0, 0.0, 1.0}),
-
 		view  = linalg.matrix4_look_at(
 			vec3{2.0, 2.0, 2.0},
 			vec3{0.0, 0.0, 0.0},
 			vec3{0.0, 0.0, 1.0},
 		),
-
 		proj  = linalg.matrix4_perspective(math.to_radians_f32(45.0), aspect, 0.1, 10.0),
 	}
 
 	ubo.proj[1, 1] *= -1
 	mapped_ubo := cast(^Uniform_Buffer_Object)ubo_map_memory_ptr
 	mapped_ubo^ = ubo
+}
+
+create_image :: proc(
+	logical_device: vk.Device,
+	physical_device: vk.PhysicalDevice,
+	width: u32,
+	height: u32,
+	format: vk.Format,
+	usage: vk.ImageUsageFlags,
+	properties: vk.MemoryPropertyFlags,
+) -> (
+	vk.Image,
+	vk.DeviceMemory,
+) {
+	image_ci := vk.ImageCreateInfo {
+		sType = .IMAGE_CREATE_INFO,
+		imageType = .D2,
+		extent = {width = width, height = height, depth = 1},
+		mipLevels = 1,
+		arrayLayers = 1,
+		format = format,
+		tiling = .OPTIMAL,
+		initialLayout = .UNDEFINED,
+		usage = usage,
+		sharingMode = .EXCLUSIVE,
+		samples = {._1},
+	}
+
+	image: vk.Image
+	image_result := vk.CreateImage(logical_device, &image_ci, nil, &image)
+	assert(image_result == .SUCCESS, "failed to create image")
+
+	memory_requirements: vk.MemoryRequirements
+	vk.GetImageMemoryRequirements(logical_device, image, &memory_requirements)
+
+	memory_type_index, ok := find_memory_type(
+		physical_device,
+		memory_requirements.memoryTypeBits,
+		properties,
+	)
+
+	assert(ok, "failed to find memory type")
+
+	allocation_i := vk.MemoryAllocateInfo {
+		sType           = .MEMORY_ALLOCATE_INFO,
+		allocationSize  = memory_requirements.size,
+		memoryTypeIndex = memory_type_index,
+	}
+
+	image_memory: vk.DeviceMemory
+	image_memory_result := vk.AllocateMemory(logical_device, &allocation_i, nil, &image_memory)
+	assert(image_memory_result == .SUCCESS, "failed to allocate image memory")
+
+	image_bind_result := vk.BindImageMemory(logical_device, image, image_memory, vk.DeviceSize(0))
+	assert(image_bind_result == .SUCCESS, "failed to bind image memory")
+
+	return image, image_memory
+}
+
+create_image_texture :: proc(
+	logical_device: vk.Device,
+	physical_device: vk.PhysicalDevice,
+	path: string,
+	command_pool: vk.CommandPool,
+	queue: vk.Queue,
+) -> (
+	vk.Image,
+	vk.DeviceMemory,
+) {
+	image_source, err := image.load(path, {.alpha_add_if_missing})
+	assert(err == nil, "failed to open image file")
+	assert(image_source.channels == 4, "image shuld have 4 channels - rgba")
+
+	width := u32(image_source.width)
+	height := u32(image_source.height)
+	size := u64(width) * u64(height) * u64(image_source.channels)
+
+	staging_buffer, staging_buffer_memory := create_buffer(
+		physical_device,
+		logical_device,
+		size,
+		{.TRANSFER_SRC},
+		{.HOST_VISIBLE, .HOST_COHERENT},
+	)
+
+	defer vk.DestroyBuffer(logical_device, staging_buffer, nil)
+	defer vk.FreeMemory(logical_device, staging_buffer_memory, nil)
+
+	memory_copy_to_buffer(
+		logical_device,
+		staging_buffer_memory,
+		bytes.buffer_to_bytes(&image_source.pixels),
+	)
+
+	image.destroy(image_source)
+	img, img_memory := create_image(
+		logical_device,
+		physical_device,
+		width,
+		height,
+		.R8G8B8A8_SRGB,
+		{.TRANSFER_DST, .SAMPLED},
+		{.DEVICE_LOCAL},
+	)
+
+	command_buffer := begin_oneshot_commands(logical_device, command_pool)
+
+	transition_image_layout(
+		command_buffer,
+		img,
+		.UNDEFINED,
+		.TRANSFER_DST_OPTIMAL,
+		{},
+		{.TRANSFER_WRITE},
+		{.TOP_OF_PIPE},
+		{.TRANSFER},
+	)
+
+	transfer_buffer_to_image(command_buffer, staging_buffer, img, width, height)
+
+	transition_image_layout(
+		command_buffer,
+		img,
+		.TRANSFER_DST_OPTIMAL,
+		.SHADER_READ_ONLY_OPTIMAL,
+		{.TRANSFER_WRITE},
+		{.SHADER_READ},
+		{.TRANSFER},
+		{.FRAGMENT_SHADER},
+	)
+
+	end_oneshot_commands(logical_device, command_pool, command_buffer, queue)
+
+	return img, img_memory
+}
+
+begin_oneshot_commands :: proc(
+	logical_device: vk.Device,
+	command_pool: vk.CommandPool,
+) -> vk.CommandBuffer {
+	command_buffer := create_command_buffer(logical_device, command_pool)
+	begin_command_buffer(command_buffer, {.ONE_TIME_SUBMIT})
+	return command_buffer
+}
+
+end_oneshot_commands :: proc(
+	logical_device: vk.Device,
+	command_pool: vk.CommandPool,
+	command_buffer: vk.CommandBuffer,
+	queue: vk.Queue,
+) {
+	command_buffer := command_buffer
+
+	end_command_buffer(command_buffer)
+
+	submit_i := vk.SubmitInfo {
+		sType              = .SUBMIT_INFO,
+		commandBufferCount = 1,
+		pCommandBuffers    = &command_buffer,
+	}
+
+	submit_result := vk.QueueSubmit(queue, 1, &submit_i, 0)
+	assert(submit_result == .SUCCESS, "failed to submit one shot command")
+
+	wait_result := vk.QueueWaitIdle(queue)
+	assert(wait_result == .SUCCESS, "failed to wait on queue completion")
+
+	vk.FreeCommandBuffers(logical_device, command_pool, 1, &command_buffer)
 }
 
 // >----------------------------------------------------------------------- GLFW
@@ -1736,6 +1939,19 @@ main :: proc() {
 
 	fmt.println("Vulkan index buffer allocated and created")
 
+	img, img_memory := create_image_texture(
+		logical_device,
+		physical_device,
+		"assets/images/statue.jpg",
+		command_pool,
+		graphics_queue,
+	)
+
+	fmt.println("Vulkan image texture created")
+
+	defer vk.DestroyImage(logical_device, img, nil)
+	defer vk.FreeMemory(logical_device, img_memory, nil)
+
 	ubo_buffers: [VK_NUM_FRAMES_IN_FLIGHT]vk.Buffer
 	ubo_buffer_memories: [VK_NUM_FRAMES_IN_FLIGHT]vk.DeviceMemory
 	ubo_map_memory_ptrs: [VK_NUM_FRAMES_IN_FLIGHT]rawptr
@@ -1820,7 +2036,7 @@ main :: proc() {
 				vertex_buffer,
 				index_buffer,
 				u32(len(indices)),
-				descriptor_sets[frame_index]
+				descriptor_sets[frame_index],
 			)
 
 			submit_command_buffer(
