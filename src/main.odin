@@ -231,6 +231,11 @@ score_physical_device :: proc(physical_device: vk.PhysicalDevice, surface: vk.Su
 		return -1
 	}
 
+	if !features.default.samplerAnisotropy {
+		fmt.println("missing samplerAnisotropy")
+		return -1
+	}
+
 	score := 0
 
 	// Discrete GPU's have a significant performance advantage.
@@ -870,6 +875,7 @@ create_logical_device :: proc(
 	df_2 := vk.PhysicalDeviceFeatures2 {
 		sType = .PHYSICAL_DEVICE_FEATURES_2,
 		pNext = &df_vulkan11,
+		features = {samplerAnisotropy = true},
 	}
 
 	logical_device_ci := vk.DeviceCreateInfo {
@@ -986,6 +992,26 @@ create_image_views :: proc(
 	}
 
 	return image_views
+}
+
+create_image_view :: proc(
+	logical_device: vk.Device,
+	image: vk.Image,
+	format: vk.Format,
+) -> vk.ImageView {
+	image_view_ci := vk.ImageViewCreateInfo {
+		sType            = .IMAGE_VIEW_CREATE_INFO,
+		viewType         = .D2,
+		format           = format,
+		subresourceRange = {{.COLOR}, 0, 1, 0, 1},
+		image            = image,
+	}
+
+	image_view: vk.ImageView
+	image_view_result := vk.CreateImageView(logical_device, &image_view_ci, nil, &image_view)
+	assert(image_view_result == .SUCCESS, "failed to create an image view")
+
+	return image_view
 }
 
 create_shader_module :: proc(
@@ -1740,6 +1766,39 @@ end_oneshot_commands :: proc(
 	vk.FreeCommandBuffers(logical_device, command_pool, 1, &command_buffer)
 }
 
+create_sampler :: proc(
+	logical_device: vk.Device,
+	physical_device: vk.PhysicalDevice,
+) -> vk.Sampler {
+	properties: vk.PhysicalDeviceProperties
+	vk.GetPhysicalDeviceProperties(physical_device, &properties)
+
+	sampler_ci := vk.SamplerCreateInfo {
+		sType                   = .SAMPLER_CREATE_INFO,
+		magFilter               = .LINEAR,
+		minFilter               = .LINEAR,
+		addressModeU            = .REPEAT,
+		addressModeV            = .REPEAT,
+		addressModeW            = .REPEAT,
+		anisotropyEnable        = true,
+		maxAnisotropy           = properties.limits.maxSamplerAnisotropy,
+		borderColor             = .INT_OPAQUE_BLACK,
+		unnormalizedCoordinates = false,
+		compareEnable           = false,
+		compareOp               = .ALWAYS,
+		mipmapMode              = .LINEAR,
+		mipLodBias              = 0.0,
+		minLod                  = 0.0,
+		maxLod                  = 0.0,
+	}
+
+	sampler: vk.Sampler
+	sampler_result := vk.CreateSampler(logical_device, &sampler_ci, nil, &sampler)
+
+
+	return sampler
+}
+
 // >----------------------------------------------------------------------- GLFW
 
 init_glfw :: proc() {
@@ -1947,10 +2006,17 @@ main :: proc() {
 		graphics_queue,
 	)
 
-	fmt.println("Vulkan image texture created")
-
 	defer vk.DestroyImage(logical_device, img, nil)
 	defer vk.FreeMemory(logical_device, img_memory, nil)
+	fmt.println("Vulkan image texture created")
+
+	img_view := create_image_view(logical_device, img, .R8G8B8A8_SRGB)
+	defer vk.DestroyImageView(logical_device, img_view, nil)
+	fmt.println("Vulkan image view created")
+
+	sampler := create_sampler(logical_device, physical_device)
+	defer vk.DestroySampler(logical_device, sampler, nil)
+	fmt.println("Vulkam sampler created")
 
 	ubo_buffers: [VK_NUM_FRAMES_IN_FLIGHT]vk.Buffer
 	ubo_buffer_memories: [VK_NUM_FRAMES_IN_FLIGHT]vk.DeviceMemory
