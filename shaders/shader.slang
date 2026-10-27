@@ -4,6 +4,7 @@ struct VertexInput
 {
     float2 pos;
     float3 color;
+    float2 tex_coord;
 };
 
 struct UniformBuffer {
@@ -16,11 +17,11 @@ struct VertexOutput
 {
     float4 pos: SV_Position;
     float3 color;
+    float2 tex_coord;
 };
 
-// >-------------------------------------------------------------------- buffers
-
 ConstantBuffer<UniformBuffer> ubo;
+Sampler2D texture;
 
 // >-------------------------------------------------------------- vertex shader
 
@@ -36,6 +37,8 @@ VertexOutput vertMain(VertexInput input, uint id : SV_VertexID)
     );
 
     output.color = input.color;
+    output.tex_coord = input.tex_coord;
+    
     return output;
 }
 
@@ -44,5 +47,5 @@ VertexOutput vertMain(VertexInput input, uint id : SV_VertexID)
 [shader("fragment")]
 float4 fragMain(VertexOutput input) : SV_Target
 {
-    return float4(input.color, 1.0);
+    return texture.Sample(input.tex_coord);
 }

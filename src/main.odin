@@ -32,8 +32,9 @@ vec3 :: [3]f32
 mat4 :: matrix[4, 4]f32
 
 Vertex :: struct {
-	pos:   vec2,
-	color: vec3,
+	pos:       vec2,
+	color:     vec3,
+	tex_coord: vec2,
 }
 
 Uniform_Buffer_Object :: struct {
@@ -1090,6 +1091,12 @@ create_graphics_pipeline :: proc(
 			format = .R32G32B32_SFLOAT,
 			offset = u32(offset_of(Vertex, color)),
 		},
+		{
+			binding = 0,
+			location = 2,
+			format = .R32G32_SFLOAT,
+			offset = u32(offset_of(Vertex, tex_coord)),
+		},
 	}
 
 	vertex_input_ci := vk.PipelineVertexInputStateCreateInfo {
@@ -1452,17 +1459,26 @@ memory_copy_to_buffer :: proc(
 
 
 create_descriptor_set_layout :: proc(logical_device: vk.Device) -> vk.DescriptorSetLayout {
-	layout_binding := vk.DescriptorSetLayoutBinding {
+	ubo_binding := vk.DescriptorSetLayoutBinding {
 		binding         = 0,
 		descriptorType  = .UNIFORM_BUFFER,
 		descriptorCount = 1,
 		stageFlags      = {.VERTEX},
 	}
 
+	sampler_binding := vk.DescriptorSetLayoutBinding {
+		binding         = 1,
+		descriptorType  = .COMBINED_IMAGE_SAMPLER,
+		descriptorCount = 1,
+		stageFlags      = {.FRAGMENT},
+	}
+
+	layout_bindings := []vk.DescriptorSetLayoutBinding{ubo_binding, sampler_binding}
+
 	layout_ci := vk.DescriptorSetLayoutCreateInfo {
 		sType        = .DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-		bindingCount = 1,
-		pBindings    = &layout_binding,
+		bindingCount = u32(len(layout_bindings)),
+		pBindings    = raw_data(layout_bindings),
 	}
 
 	descriptor_set_layout: vk.DescriptorSetLayout
@@ -1480,19 +1496,16 @@ create_descriptor_set_layout :: proc(logical_device: vk.Device) -> vk.Descriptor
 
 create_descriptor_pool :: proc(
 	logical_device: vk.Device,
-	descriptor_type: vk.DescriptorType,
-	descriptor_count: u32,
+	pool_sizes: []vk.DescriptorPoolSize,
+	max_sets: u32,
 ) -> vk.DescriptorPool {
-	pool_size := vk.DescriptorPoolSize {
-		type            = descriptor_type,
-		descriptorCount = descriptor_count,
-	}
+	pool_sizes := pool_sizes
 
 	pool_ci := vk.DescriptorPoolCreateInfo {
 		sType         = .DESCRIPTOR_POOL_CREATE_INFO,
-		poolSizeCount = 1,
-		pPoolSizes    = &pool_size,
-		maxSets       = descriptor_count,
+		poolSizeCount = u32(len(pool_sizes)),
+		pPoolSizes    = raw_data(pool_sizes),
+		maxSets       = max_sets,
 	}
 
 	descriptor_pool: vk.DescriptorPool
@@ -1544,6 +1557,8 @@ update_descriptor_set :: proc(
 	logical_device: vk.Device,
 	descriptor_set: vk.DescriptorSet,
 	uniform_buffer: vk.Buffer,
+	image_view: vk.ImageView,
+	sampler: vk.Sampler,
 ) {
 	buffer_i := vk.DescriptorBufferInfo {
 		buffer = uniform_buffer,
@@ -1551,17 +1566,35 @@ update_descriptor_set :: proc(
 		range  = size_of(Uniform_Buffer_Object),
 	}
 
-	write_descriptor_set := vk.WriteDescriptorSet {
+	image_i := vk.DescriptorImageInfo {
+		imageLayout = .SHADER_READ_ONLY_OPTIMAL,
+		imageView   = image_view,
+		sampler     = sampler,
+	}
+
+	ubo_descriptor_write := vk.WriteDescriptorSet {
 		sType           = .WRITE_DESCRIPTOR_SET,
 		dstSet          = descriptor_set,
 		dstBinding      = 0,
 		dstArrayElement = 0,
-		descriptorCount = 1,
 		descriptorType  = .UNIFORM_BUFFER,
+		descriptorCount = 1,
 		pBufferInfo     = &buffer_i,
 	}
 
-	vk.UpdateDescriptorSets(logical_device, 1, &write_descriptor_set, 0, nil)
+	image_sampler_descriptor_write := vk.WriteDescriptorSet {
+		sType           = .WRITE_DESCRIPTOR_SET,
+		dstSet          = descriptor_set,
+		dstBinding      = 1,
+		dstArrayElement = 0,
+		descriptorType  = .COMBINED_IMAGE_SAMPLER,
+		descriptorCount = 1,
+		pImageInfo      = &image_i,
+	}
+
+	writes := []vk.WriteDescriptorSet{ubo_descriptor_write, image_sampler_descriptor_write}
+
+	vk.UpdateDescriptorSets(logical_device, u32(len(writes)), raw_data(writes), 0, nil)
 }
 
 
@@ -1893,7 +1926,10 @@ main :: proc() {
 
 	descriptor_pool := create_descriptor_pool(
 		logical_device,
-		.UNIFORM_BUFFER,
+		{
+			{type = .UNIFORM_BUFFER, descriptorCount = VK_NUM_FRAMES_IN_FLIGHT},
+			{type = .COMBINED_IMAGE_SAMPLER, descriptorCount = VK_NUM_FRAMES_IN_FLIGHT},
+		},
 		VK_NUM_FRAMES_IN_FLIGHT,
 	)
 	defer vk.DestroyDescriptorPool(logical_device, descriptor_pool, nil)
@@ -1961,10 +1997,10 @@ main :: proc() {
 	fmt.println("Vulkan draw fences created")
 
 	vertices := []Vertex {
-		{pos = {-0.5, -0.5}, color = {1.0, 0.0, 0.0}},
-		{pos = {0.5, -0.5}, color = {0.0, 1.0, 0.0}},
-		{pos = {0.5, 0.5}, color = {0.0, 0.0, 1.0}},
-		{pos = {-0.5, 0.5}, color = {1.0, 1.0, 1.0}},
+		{pos = {-0.5, -0.5}, color = {1.0, 0.0, 0.0}, tex_coord = {1.0, 0.0}},
+		{pos = {0.5, -0.5}, color = {0.0, 1.0, 0.0}, tex_coord = {0.0, 0.0}},
+		{pos = {0.5, 0.5}, color = {0.0, 0.0, 1.0}, tex_coord = {0.0, 1.0}},
+		{pos = {-0.5, 0.5}, color = {1.0, 1.0, 1.0}, tex_coord = {1.0, 1.0}},
 	}
 
 	vertex_buffer, vertex_buffer_memory := create_buffer(
@@ -2053,7 +2089,13 @@ main :: proc() {
 	fmt.println("Vulkan uniform buffers created")
 
 	for i in 0 ..< VK_NUM_FRAMES_IN_FLIGHT {
-		update_descriptor_set(logical_device, descriptor_sets[i], ubo_buffers[i])
+		update_descriptor_set(
+			logical_device,
+			descriptor_sets[i],
+			ubo_buffers[i],
+			img_view,
+			sampler,
+		)
 	}
 
 	fmt.println("Vulkan descriptor sets updated")
