@@ -1,21 +1,23 @@
 package main
 
+import "../libs/tinyobj"
 import "base:runtime"
 import "core:bytes"
 import "core:fmt"
 import "core:image"
-import "core:image/jpeg"
+import "core:image/png"
 import "core:math"
 import "core:math/linalg"
 import "core:mem"
 import "core:os"
+import "core:path/slashpath"
 import "core:slice"
 import "core:strings"
 import "core:time"
 import "vendor:glfw"
 import vk "vendor:vulkan"
 
-_ :: jpeg
+_ :: png
 
 // >------------------------------------------------------------------ CONSTANTS
 
@@ -826,6 +828,53 @@ mat4_perspective :: proc "contextless" (fovy, aspect, near, far: f32) -> (m: mat
 	m[3, 2] = -1
 	m[2, 3] = -(far * near) / (far - near)
 
+	return
+}
+
+load_model :: proc(path: string) -> (vertices: []Vertex, indices: []u16) {
+
+	data, err := os.read_entire_file(path, context.allocator)
+	if err != nil {
+		fmt.eprintfln("Failed to read obj file: %v, error: %v", path, err)
+		os.exit(1)
+	}
+	defer delete(data)
+
+	current_dir := slashpath.dir(path)
+	defer delete(current_dir)
+	obj := tinyobj.parse_obj(string(data), current_dir, tinyobj.FLAG_TRIANGULATE)
+	if !obj.success {
+		fmt.eprintln("Failed to read obj file:", path)
+		os.exit(1)
+	}
+	defer tinyobj.destroy(&obj)
+
+	vertices = make([]Vertex, len(obj.attrib.vertices) / 3)
+	for f_index in 0 ..< len(vertices) {
+		v := Vertex {
+			pos   = {
+				obj.attrib.vertices[f_index * 3],
+				obj.attrib.vertices[(f_index * 3) + 1],
+				obj.attrib.vertices[(f_index * 3) + 2],
+			},
+			color = {1.0, 1.0, 1.0},
+		}
+
+		vertices[f_index] = v
+	}
+
+	indices_list: [dynamic]u16
+	for &vertex_index in obj.attrib.faces {
+		append(&indices_list, u16(vertex_index.v_idx))
+
+		tex_coord := vec2 {
+			obj.attrib.texcoords[vertex_index.vt_idx * 2],
+			1.0 - obj.attrib.texcoords[(vertex_index.vt_idx * 2) + 1],
+		}
+		vertices[vertex_index.v_idx].tex_coord = tex_coord
+	}
+
+	indices = indices_list[:]
 	return
 }
 
@@ -1721,7 +1770,7 @@ update_uniform_buffer :: proc(
 ) {
 	elapsed_seconds := f32(time.tick_since(start_time)) / f32(time.Second)
 
-	angle := elapsed_seconds * math.to_radians_f32(90)
+	angle := elapsed_seconds * math.to_radians_f32(90) / 10.
 
 	width := swap_chain_extent.width
 	height := swap_chain_extent.height
@@ -2130,17 +2179,7 @@ main :: proc() {
 
 	fmt.println("Vulkan draw fences created")
 
-
-	vertices := []Vertex {
-		{pos = {-0.5, -0.5, 0.0}, color = {1.0, 0.0, 0.0}, tex_coord = {1.0, 0.0}},
-		{pos = {0.5, -0.5, 0.0}, color = {0.0, 1.0, 0.0}, tex_coord = {0.0, 0.0}},
-		{pos = {0.5, 0.5, 0.0}, color = {0.0, 0.0, 1.0}, tex_coord = {0.0, 1.0}},
-		{pos = {-0.5, 0.5, 0.0}, color = {1.0, 1.0, 1.0}, tex_coord = {1.0, 1.0}},
-		{pos = {-0.5, -0.5, -0.5}, color = {1.0, 0.0, 0.0}, tex_coord = {1.0, 0.0}},
-		{pos = {0.5, -0.5, -0.5}, color = {0.0, 1.0, 0.0}, tex_coord = {0.0, 0.0}},
-		{pos = {0.5, 0.5, -0.5}, color = {0.0, 0.0, 1.0}, tex_coord = {0.0, 1.0}},
-		{pos = {-0.5, 0.5, -0.5}, color = {1.0, 1.0, 1.0}, tex_coord = {1.0, 1.0}},
-	}
+	vertices, indices := load_model("assets/models/viking_room/viking_room.obj")
 
 	vertex_buffer, vertex_buffer_memory := create_buffer(
 		physical_device,
@@ -2157,7 +2196,6 @@ main :: proc() {
 
 	fmt.println("Vulkan vertex buffer allocated and created")
 
-	indices := []u16{0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4}
 	index_buffer, index_buffer_memory := create_buffer(
 		physical_device,
 		logical_device,
@@ -2176,7 +2214,7 @@ main :: proc() {
 	img, img_memory := create_image_texture(
 		logical_device,
 		physical_device,
-		"assets/images/statue.jpg",
+		"assets/models/viking_room/viking_room.png",
 		command_pool,
 		graphics_queue,
 	)
