@@ -32,7 +32,7 @@ vec3 :: [3]f32
 mat4 :: matrix[4, 4]f32
 
 Vertex :: struct {
-	pos:       vec2,
+	pos:       vec3,
 	color:     vec3,
 	tex_coord: vec2,
 }
@@ -450,6 +450,7 @@ transition_image_layout :: proc(
 	dst_access_mask: vk.AccessFlags2,
 	src_stage_mask: vk.PipelineStageFlags2,
 	dst_stage_mask: vk.PipelineStageFlags2,
+	aspects: vk.ImageAspectFlags,
 ) {
 
 	image_barrier := vk.ImageMemoryBarrier2 {
@@ -464,7 +465,7 @@ transition_image_layout :: proc(
 		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
 		image = image,
 		subresourceRange = vk.ImageSubresourceRange {
-			aspectMask = {.COLOR},
+			aspectMask = aspects,
 			baseMipLevel = 0,
 			levelCount = 1,
 			baseArrayLayer = 0,
@@ -489,9 +490,10 @@ transition_image_layout :: proc(
 begin_rendering :: proc(
 	command_buffer: vk.CommandBuffer,
 	image_view: vk.ImageView,
+	depth_image_view: vk.ImageView,
 	swap_chain_extent: vk.Extent2D,
 ) {
-	attachment_i := vk.RenderingAttachmentInfo {
+	color_attachment_i := vk.RenderingAttachmentInfo {
 		sType = .RENDERING_ATTACHMENT_INFO,
 		imageView = image_view,
 		imageLayout = .COLOR_ATTACHMENT_OPTIMAL,
@@ -500,12 +502,22 @@ begin_rendering :: proc(
 		clearValue = {color = {float32 = {0.0, 0.0, 0.0, 1.0}}},
 	}
 
+	depth_attachment_i := vk.RenderingAttachmentInfo {
+		sType = .RENDERING_ATTACHMENT_INFO,
+		imageView = depth_image_view,
+		imageLayout = .DEPTH_ATTACHMENT_OPTIMAL,
+		loadOp = .CLEAR,
+		storeOp = .DONT_CARE,
+		clearValue = {depthStencil = {depth = 1.0, stencil = 0}},
+	}
+
 	render_i := vk.RenderingInfo {
 		sType = .RENDERING_INFO,
 		layerCount = 1,
 		renderArea = {extent = swap_chain_extent},
-		pColorAttachments = &attachment_i,
+		pColorAttachments = &color_attachment_i,
 		colorAttachmentCount = 1,
+		pDepthAttachment = &depth_attachment_i,
 	}
 
 	vk.CmdBeginRendering(command_buffer, &render_i)
@@ -744,6 +756,77 @@ transfer_buffer_to_image :: proc(
 		1,
 		&copy_region,
 	)
+}
+
+find_supported_format :: proc(
+	physical_device: vk.PhysicalDevice,
+	candidates: []vk.Format,
+	tile: vk.ImageTiling,
+	features: vk.FormatFeatureFlags,
+) -> vk.Format {
+	for format in candidates {
+		properties: vk.FormatProperties
+		vk.GetPhysicalDeviceFormatProperties(physical_device, format, &properties)
+
+		if tile == .LINEAR && (properties.linearTilingFeatures & features) == features {
+			return format
+		}
+
+		if tile == .OPTIMAL && (properties.optimalTilingFeatures & features) == features {
+			return format
+		}
+	}
+
+	panic("failed to find supported format")
+}
+
+find_depth_format :: proc(physical_device: vk.PhysicalDevice) -> vk.Format {
+	return find_supported_format(
+		physical_device,
+		{.D32_SFLOAT, .D32_SFLOAT_S8_UINT, .D24_UNORM_S8_UINT},
+		.OPTIMAL,
+		{.DEPTH_STENCIL_ATTACHMENT},
+	)
+}
+
+has_stencil_component :: proc(format: vk.Format) -> bool {
+	return format == .D32_SFLOAT_S8_UINT || format == .D24_UNORM_S8_UINT
+}
+
+create_depth_resources :: proc(
+	logical_device: vk.Device,
+	physical_device: vk.PhysicalDevice,
+	depth_format: vk.Format,
+	swap_chain_extent: vk.Extent2D,
+) -> (
+	vk.Image,
+	vk.DeviceMemory,
+	vk.ImageView,
+) {
+
+	depth_image, depth_image_memory := create_image(
+		logical_device,
+		physical_device,
+		swap_chain_extent.width,
+		swap_chain_extent.height,
+		depth_format,
+		{.DEPTH_STENCIL_ATTACHMENT},
+		{.DEVICE_LOCAL},
+	)
+
+	depth_image_view := create_image_view(logical_device, depth_image, depth_format, {.DEPTH})
+	return depth_image, depth_image_memory, depth_image_view
+}
+
+mat4_perspective :: proc "contextless" (fovy, aspect, near, far: f32) -> (m: mat4) {
+	tan_half_fovy := math.tan(0.5 * fovy)
+	m[0, 0] = 1 / (aspect * tan_half_fovy)
+	m[1, 1] = -1 / (tan_half_fovy)
+	m[2, 2] = -far / (far - near)
+	m[3, 2] = -1
+	m[2, 3] = -(far * near) / (far - near)
+
+	return
 }
 
 // >--------------------------------------------------------------- VULKAN SETUP
@@ -999,12 +1082,13 @@ create_image_view :: proc(
 	logical_device: vk.Device,
 	image: vk.Image,
 	format: vk.Format,
+	aspects: vk.ImageAspectFlags = {.COLOR},
 ) -> vk.ImageView {
 	image_view_ci := vk.ImageViewCreateInfo {
 		sType            = .IMAGE_VIEW_CREATE_INFO,
 		viewType         = .D2,
 		format           = format,
-		subresourceRange = {{.COLOR}, 0, 1, 0, 1},
+		subresourceRange = {aspects, 0, 1, 0, 1},
 		image            = image,
 	}
 
@@ -1045,6 +1129,7 @@ create_graphics_pipeline :: proc(
 	fragment_entry: string,
 	swap_chain_format: vk.Format,
 	descriptor_set_layout: vk.DescriptorSetLayout,
+	depth_format: vk.Format,
 ) -> (
 	vk.Pipeline,
 	vk.PipelineLayout,
@@ -1084,7 +1169,12 @@ create_graphics_pipeline :: proc(
 	}
 
 	vertex_attribute_description := []vk.VertexInputAttributeDescription {
-		{location = 0, binding = 0, format = .R32G32_SFLOAT, offset = u32(offset_of(Vertex, pos))},
+		{
+			location = 0,
+			binding = 0,
+			format = .R32G32B32_SFLOAT,
+			offset = u32(offset_of(Vertex, pos)),
+		},
 		{
 			location = 1,
 			binding = 0,
@@ -1159,6 +1249,14 @@ create_graphics_pipeline :: proc(
 		pAttachments    = &color_blend_attachment,
 	}
 
+	depth_stencil_state_ci := vk.PipelineDepthStencilStateCreateInfo {
+		depthTestEnable       = true,
+		depthWriteEnable      = true,
+		depthCompareOp        = .LESS,
+		depthBoundsTestEnable = false,
+		stencilTestEnable     = false,
+	}
+
 	descriptor_set_layout := descriptor_set_layout
 	pipeline_layout_ci := vk.PipelineLayoutCreateInfo {
 		sType                  = .PIPELINE_LAYOUT_CREATE_INFO,
@@ -1183,6 +1281,7 @@ create_graphics_pipeline :: proc(
 		sType                   = .PIPELINE_RENDERING_CREATE_INFO,
 		colorAttachmentCount    = 1,
 		pColorAttachmentFormats = &format,
+		depthAttachmentFormat   = depth_format,
 	}
 
 	pipeline_ci := vk.GraphicsPipelineCreateInfo {
@@ -1196,6 +1295,7 @@ create_graphics_pipeline :: proc(
 		pMultisampleState   = &multisampling_ci,
 		pColorBlendState    = &color_blend_ci,
 		pDynamicState       = &dynamic_state_ci,
+		pDepthStencilState  = &depth_stencil_state_ci,
 		layout              = pipeline_layout,
 		renderPass          = 0,
 		pNext               = &pipeline_rendering_ci,
@@ -1227,6 +1327,8 @@ record_command_buffer :: proc(
 	index_buffer: vk.Buffer,
 	index_count: u32,
 	descriptor_set: vk.DescriptorSet,
+	depth_image: vk.Image,
+	depth_image_view: vk.ImageView,
 ) {
 
 	// Begin to start the recording...
@@ -1242,10 +1344,23 @@ record_command_buffer :: proc(
 		{.COLOR_ATTACHMENT_WRITE}, // dstAccessMask
 		{.COLOR_ATTACHMENT_OUTPUT}, // srcStage
 		{.COLOR_ATTACHMENT_OUTPUT}, // dstStage
+		{.COLOR},
+	)
+
+	transition_image_layout(
+		command_buffer,
+		depth_image,
+		.UNDEFINED,
+		.DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+		{.DEPTH_STENCIL_ATTACHMENT_WRITE}, // srcAccessMask
+		{.DEPTH_STENCIL_ATTACHMENT_WRITE}, // dstAccessMask
+		{.EARLY_FRAGMENT_TESTS, .LATE_FRAGMENT_TESTS}, // srcStage
+		{.EARLY_FRAGMENT_TESTS, .LATE_FRAGMENT_TESTS}, // dstStage
+		{.DEPTH},
 	)
 
 	// Start rendering
-	begin_rendering(command_buffer, image_view, swap_chain_extent)
+	begin_rendering(command_buffer, image_view, depth_image_view, swap_chain_extent)
 
 	// We can now bind the graphics pipeline
 	vk.CmdBindPipeline(command_buffer, .GRAPHICS, graphics_pipeline)
@@ -1295,6 +1410,7 @@ record_command_buffer :: proc(
 		{}, // dstAccessMask
 		{.COLOR_ATTACHMENT_OUTPUT}, // srcStage
 		{.BOTTOM_OF_PIPE}, // dstStage
+		{.COLOR},
 	)
 
 	end_command_buffer(command_buffer)
@@ -1745,6 +1861,7 @@ create_image_texture :: proc(
 		{.TRANSFER_WRITE},
 		{.TOP_OF_PIPE},
 		{.TRANSFER},
+		{.COLOR},
 	)
 
 	transfer_buffer_to_image(command_buffer, staging_buffer, img, width, height)
@@ -1758,6 +1875,7 @@ create_image_texture :: proc(
 		{.SHADER_READ},
 		{.TRANSFER},
 		{.FRAGMENT_SHADER},
+		{.COLOR},
 	)
 
 	end_oneshot_commands(logical_device, command_pool, command_buffer, queue)
@@ -1942,6 +2060,21 @@ main :: proc() {
 	)
 	defer delete(descriptor_sets)
 
+	depth_format := find_depth_format(physical_device)
+	fmt.println("Vulkan depth format found")
+
+	depth_image, depth_memory, depth_image_view := create_depth_resources(
+		logical_device,
+		physical_device,
+		depth_format,
+		swap_chain_extent,
+	)
+	defer vk.FreeMemory(logical_device, depth_memory, nil)
+	defer vk.DestroyImage(logical_device, depth_image, nil)
+	defer vk.DestroyImageView(logical_device, depth_image_view, nil)
+
+	fmt.println("Vulkan depth resources acquired")
+
 	graphics_pipeline, pipeline_layout := create_graphics_pipeline(
 		logical_device,
 		shader_module,
@@ -1949,6 +2082,7 @@ main :: proc() {
 		"fragMain",
 		swap_chain_format,
 		ubo_descriptor_set_layout,
+		depth_format,
 	)
 	defer vk.DestroyPipelineLayout(logical_device, pipeline_layout, nil)
 	defer vk.DestroyPipeline(logical_device, graphics_pipeline, nil)
@@ -1996,11 +2130,16 @@ main :: proc() {
 
 	fmt.println("Vulkan draw fences created")
 
+
 	vertices := []Vertex {
-		{pos = {-0.5, -0.5}, color = {1.0, 0.0, 0.0}, tex_coord = {1.0, 0.0}},
-		{pos = {0.5, -0.5}, color = {0.0, 1.0, 0.0}, tex_coord = {0.0, 0.0}},
-		{pos = {0.5, 0.5}, color = {0.0, 0.0, 1.0}, tex_coord = {0.0, 1.0}},
-		{pos = {-0.5, 0.5}, color = {1.0, 1.0, 1.0}, tex_coord = {1.0, 1.0}},
+		{pos = {-0.5, -0.5, 0.0}, color = {1.0, 0.0, 0.0}, tex_coord = {1.0, 0.0}},
+		{pos = {0.5, -0.5, 0.0}, color = {0.0, 1.0, 0.0}, tex_coord = {0.0, 0.0}},
+		{pos = {0.5, 0.5, 0.0}, color = {0.0, 0.0, 1.0}, tex_coord = {0.0, 1.0}},
+		{pos = {-0.5, 0.5, 0.0}, color = {1.0, 1.0, 1.0}, tex_coord = {1.0, 1.0}},
+		{pos = {-0.5, -0.5, -0.5}, color = {1.0, 0.0, 0.0}, tex_coord = {1.0, 0.0}},
+		{pos = {0.5, -0.5, -0.5}, color = {0.0, 1.0, 0.0}, tex_coord = {0.0, 0.0}},
+		{pos = {0.5, 0.5, -0.5}, color = {0.0, 0.0, 1.0}, tex_coord = {0.0, 1.0}},
+		{pos = {-0.5, 0.5, -0.5}, color = {1.0, 1.0, 1.0}, tex_coord = {1.0, 1.0}},
 	}
 
 	vertex_buffer, vertex_buffer_memory := create_buffer(
@@ -2018,7 +2157,7 @@ main :: proc() {
 
 	fmt.println("Vulkan vertex buffer allocated and created")
 
-	indices := []u16{0, 1, 2, 2, 3, 0}
+	indices := []u16{0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4}
 	index_buffer, index_buffer_memory := create_buffer(
 		physical_device,
 		logical_device,
@@ -2145,6 +2284,8 @@ main :: proc() {
 				index_buffer,
 				u32(len(indices)),
 				descriptor_sets[frame_index],
+				depth_image,
+				depth_image_view,
 			)
 
 			submit_command_buffer(
@@ -2194,6 +2335,17 @@ main :: proc() {
 				logical_device,
 				swap_chain_images,
 				swap_chain_format,
+			)
+
+			vk.DestroyImageView(logical_device, depth_image_view, nil)
+			vk.DestroyImage(logical_device, depth_image, nil)
+			vk.FreeMemory(logical_device, depth_memory, nil)
+
+			depth_image, depth_memory, depth_image_view = create_depth_resources(
+				logical_device,
+				physical_device,
+				depth_format,
+				swap_chain_extent,
 			)
 
 			for semaphore in submit_semaphores {
