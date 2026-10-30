@@ -453,8 +453,8 @@ transition_image_layout :: proc(
 	src_stage_mask: vk.PipelineStageFlags2,
 	dst_stage_mask: vk.PipelineStageFlags2,
 	aspects: vk.ImageAspectFlags,
+	mip_level_count: u32,
 ) {
-
 	image_barrier := vk.ImageMemoryBarrier2 {
 		sType = .IMAGE_MEMORY_BARRIER_2,
 		srcStageMask = src_stage_mask,
@@ -469,7 +469,7 @@ transition_image_layout :: proc(
 		subresourceRange = vk.ImageSubresourceRange {
 			aspectMask = aspects,
 			baseMipLevel = 0,
-			levelCount = 1,
+			levelCount = mip_level_count,
 			baseArrayLayer = 0,
 			layerCount = 1,
 		},
@@ -811,12 +811,13 @@ create_depth_resources :: proc(
 		physical_device,
 		swap_chain_extent.width,
 		swap_chain_extent.height,
+		1,
 		depth_format,
 		{.DEPTH_STENCIL_ATTACHMENT},
 		{.DEVICE_LOCAL},
 	)
 
-	depth_image_view := create_image_view(logical_device, depth_image, depth_format, {.DEPTH})
+	depth_image_view := create_image_view(logical_device, depth_image, depth_format, {.DEPTH}, 1)
 	return depth_image, depth_image_memory, depth_image_view
 }
 
@@ -876,6 +877,10 @@ load_model :: proc(path: string) -> (vertices: []Vertex, indices: []u16) {
 
 	indices = indices_list[:]
 	return
+}
+
+count_mip_levels :: proc(width: u32, height: u32) -> u32 {
+	return u32(math.floor(math.log2(f32(max(width, height))))) + 1
 }
 
 // >--------------------------------------------------------------- VULKAN SETUP
@@ -1132,12 +1137,13 @@ create_image_view :: proc(
 	image: vk.Image,
 	format: vk.Format,
 	aspects: vk.ImageAspectFlags = {.COLOR},
+	mip_level_count: u32,
 ) -> vk.ImageView {
 	image_view_ci := vk.ImageViewCreateInfo {
 		sType            = .IMAGE_VIEW_CREATE_INFO,
 		viewType         = .D2,
 		format           = format,
-		subresourceRange = {aspects, 0, 1, 0, 1},
+		subresourceRange = {aspects, 0, mip_level_count, 0, 1},
 		image            = image,
 	}
 
@@ -1394,6 +1400,7 @@ record_command_buffer :: proc(
 		{.COLOR_ATTACHMENT_OUTPUT}, // srcStage
 		{.COLOR_ATTACHMENT_OUTPUT}, // dstStage
 		{.COLOR},
+		1,
 	)
 
 	transition_image_layout(
@@ -1406,6 +1413,7 @@ record_command_buffer :: proc(
 		{.EARLY_FRAGMENT_TESTS, .LATE_FRAGMENT_TESTS}, // srcStage
 		{.EARLY_FRAGMENT_TESTS, .LATE_FRAGMENT_TESTS}, // dstStage
 		{.DEPTH},
+		1,
 	)
 
 	// Start rendering
@@ -1460,6 +1468,7 @@ record_command_buffer :: proc(
 		{.COLOR_ATTACHMENT_OUTPUT}, // srcStage
 		{.BOTTOM_OF_PIPE}, // dstStage
 		{.COLOR},
+		1,
 	)
 
 	end_command_buffer(command_buffer)
@@ -1801,6 +1810,7 @@ create_image :: proc(
 	physical_device: vk.PhysicalDevice,
 	width: u32,
 	height: u32,
+	mip_levels_count: u32,
 	format: vk.Format,
 	usage: vk.ImageUsageFlags,
 	properties: vk.MemoryPropertyFlags,
@@ -1812,7 +1822,7 @@ create_image :: proc(
 		sType = .IMAGE_CREATE_INFO,
 		imageType = .D2,
 		extent = {width = width, height = height, depth = 1},
-		mipLevels = 1,
+		mipLevels = mip_levels_count,
 		arrayLayers = 1,
 		format = format,
 		tiling = .OPTIMAL,
@@ -1862,6 +1872,7 @@ create_image_texture :: proc(
 ) -> (
 	vk.Image,
 	vk.DeviceMemory,
+	u32,
 ) {
 	image_source, err := image.load(path, {.alpha_add_if_missing})
 	assert(err == nil, "failed to open image file")
@@ -1870,6 +1881,7 @@ create_image_texture :: proc(
 	width := u32(image_source.width)
 	height := u32(image_source.height)
 	size := u64(width) * u64(height) * u64(image_source.channels)
+	mip_level_count := count_mip_levels(width, height)
 
 	staging_buffer, staging_buffer_memory := create_buffer(
 		physical_device,
@@ -1894,6 +1906,7 @@ create_image_texture :: proc(
 		physical_device,
 		width,
 		height,
+		mip_level_count,
 		.R8G8B8A8_SRGB,
 		{.TRANSFER_DST, .SAMPLED},
 		{.DEVICE_LOCAL},
@@ -1911,6 +1924,7 @@ create_image_texture :: proc(
 		{.TOP_OF_PIPE},
 		{.TRANSFER},
 		{.COLOR},
+		mip_level_count,
 	)
 
 	transfer_buffer_to_image(command_buffer, staging_buffer, img, width, height)
@@ -1925,11 +1939,12 @@ create_image_texture :: proc(
 		{.TRANSFER},
 		{.FRAGMENT_SHADER},
 		{.COLOR},
+		mip_level_count,
 	)
 
 	end_oneshot_commands(logical_device, command_pool, command_buffer, queue)
 
-	return img, img_memory
+	return img, img_memory, mip_level_count
 }
 
 begin_oneshot_commands :: proc(
@@ -1989,7 +2004,7 @@ create_sampler :: proc(
 		mipmapMode              = .LINEAR,
 		mipLodBias              = 0.0,
 		minLod                  = 0.0,
-		maxLod                  = 0.0,
+		maxLod                  = vk.LOD_CLAMP_NONE,
 	}
 
 	sampler: vk.Sampler
@@ -2020,6 +2035,129 @@ create_window :: proc(width: u32, height: u32) -> Window {
 	assert(handle != nil, "unable to create window")
 
 	return Window{handle = handle, width = width, height = height}
+}
+
+generate_mipmaps :: proc(
+	physical_device: vk.PhysicalDevice,
+	image: vk.Image,
+	format: vk.Format,
+	width: u32,
+	height: u32,
+	mip_levels: u32,
+	command_buffer: vk.CommandBuffer,
+) {
+
+	format_props: vk.FormatProperties
+	vk.GetPhysicalDeviceFormatProperties(physical_device, format, &format_props)
+
+	if ((format_props.optimalTilingFeatures & {.SAMPLED_IMAGE_FILTER_LINEAR}) !=
+		   {.SAMPLED_IMAGE_FILTER_LINEAR}) {
+		fmt.eprintln("Texture image format does not support linear blitting!")
+		os.exit(1)
+	}
+
+	barrier := vk.ImageMemoryBarrier {
+		sType               = .IMAGE_MEMORY_BARRIER,
+		image               = image,
+		srcQueueFamilyIndex = 0, //VK_QUEUE_FAMILY_IGNORED
+		dstQueueFamilyIndex = 0, //VK_QUEUE_FAMILY_IGNORED
+		subresourceRange    = {{.COLOR}, 0, 1, 0, 1},
+	}
+
+	mip_width := width
+	mip_height := height
+
+	for i in 1 ..< mip_levels {
+		barrier.subresourceRange.baseMipLevel = i - 1
+		barrier.oldLayout = .TRANSFER_DST_OPTIMAL
+		barrier.newLayout = .TRANSFER_SRC_OPTIMAL
+		barrier.srcAccessMask = {.TRANSFER_WRITE}
+		barrier.dstAccessMask = {.TRANSFER_READ}
+
+		vk.CmdPipelineBarrier(
+			command_buffer,
+			{.TRANSFER},
+			{.TRANSFER},
+			{},
+			0,
+			nil,
+			0,
+			nil,
+			1,
+			&barrier,
+		)
+
+		blit := vk.ImageBlit {
+			srcOffsets     = {{0, 0, 0}, {i32(mip_width), i32(mip_height), 1}},
+			srcSubresource = {{.COLOR}, i - 1, 0, 1},
+			dstOffsets     = {
+				{0, 0, 0},
+				{
+					i32(mip_width > 1 ? mip_width / 2 : 1),
+					i32(mip_height > 1 ? mip_height / 2 : 1),
+					1,
+				},
+			},
+			dstSubresource = {{.COLOR}, i, 0, 1},
+		}
+
+
+		vk.CmdBlitImage(
+			command_buffer,
+			image,
+			.TRANSFER_SRC_OPTIMAL,
+			image,
+			.TRANSFER_DST_OPTIMAL,
+			1,
+			&blit,
+			.LINEAR,
+		)
+
+		barrier.oldLayout = .TRANSFER_SRC_OPTIMAL
+		barrier.newLayout = .SHADER_READ_ONLY_OPTIMAL
+		barrier.srcAccessMask = {.TRANSFER_READ}
+		barrier.dstAccessMask = {.SHADER_READ}
+
+		vk.CmdPipelineBarrier(
+			command_buffer,
+			{.TRANSFER},
+			{.FRAGMENT_SHADER},
+			{},
+			0,
+			nil,
+			0,
+			nil,
+			1,
+			&barrier,
+		)
+
+		if mip_width > 1 {
+			mip_width /= 2
+		}
+		if mip_height > 1 {
+			mip_height /= 2
+		}
+	}
+
+	barrier.subresourceRange.baseMipLevel = mip_levels - 1
+	barrier.oldLayout = .TRANSFER_DST_OPTIMAL
+	barrier.newLayout = .SHADER_READ_ONLY_OPTIMAL
+	barrier.srcAccessMask = {.TRANSFER_WRITE}
+	barrier.dstAccessMask = {.SHADER_READ}
+
+	vk.CmdPipelineBarrier(
+		command_buffer,
+		{.TRANSFER},
+		{.FRAGMENT_SHADER},
+		{},
+		0,
+		nil,
+		0,
+		nil,
+		1,
+		&barrier,
+	)
+
 }
 
 // >---------------------------------------------------------------- APPLICATION
@@ -2211,7 +2349,7 @@ main :: proc() {
 
 	fmt.println("Vulkan index buffer allocated and created")
 
-	img, img_memory := create_image_texture(
+	img, img_memory, mip_level_count := create_image_texture(
 		logical_device,
 		physical_device,
 		"assets/models/viking_room/viking_room.png",
@@ -2223,7 +2361,7 @@ main :: proc() {
 	defer vk.FreeMemory(logical_device, img_memory, nil)
 	fmt.println("Vulkan image texture created")
 
-	img_view := create_image_view(logical_device, img, .R8G8B8A8_SRGB)
+	img_view := create_image_view(logical_device, img, .R8G8B8A8_SRGB, {.COLOR}, mip_level_count)
 	defer vk.DestroyImageView(logical_device, img_view, nil)
 	fmt.println("Vulkan image view created")
 
