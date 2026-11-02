@@ -1,5 +1,6 @@
 package ovk
 
+import "base:runtime"
 import "core:strings"
 import "vendor:glfw"
 import vk "vendor:vulkan"
@@ -13,7 +14,27 @@ Window :: struct {
 	height:                 u32,
 	is_framebuffer_resized: bool,
 	is_resizable:           bool,
+	events:                 [dynamic]Window_Event,
 }
+
+Window_Event :: union {
+	Window_Event_Resize,
+	Window_Event_Key,
+	Window_Event_Close,
+}
+
+Window_Event_Resize :: struct {
+	width:  u32,
+	height: u32,
+}
+
+Window_Event_Key :: struct {
+	key:     i32,
+	actions: i32,
+	mods:    i32,
+}
+
+Window_Event_Close :: struct {}
 
 // >--------------------------------------------------------------------- Window
 
@@ -32,26 +53,33 @@ window_create :: proc(
 		height                 = height,
 		is_framebuffer_resized = false,
 		is_resizable           = is_resizable,
+		events                 = make([dynamic]Window_Event, 0, 64),
 	}
 
 	ctitle := strings.clone_to_cstring(title, context.temp_allocator)
 	window.handle = glfw.CreateWindow(i32(width), i32(height), ctitle, nil, nil)
-
 	if window.handle == nil do return Window{}, GLFW_Error{message = "Failed to create GLFW window"}
+
+	glfw.SetWindowUserPointer(window.handle, &window)
+	glfw.SetWindowSizeCallback(window.handle, on_framebuffer_size)
+	glfw.SetKeyCallback(window.handle, on_key)
+	glfw.SetWindowCloseCallback(window.handle, on_window_close)
+
 	return window, nil
 }
 
-window_destroy :: proc(window: Window) {
+window_destroy :: proc(window: ^Window) {
 	if window.handle == nil do return
 	glfw.DestroyWindow(window.handle)
+	delete(window.events)
 }
 
-window_should_close :: proc(window: Window) -> bool {
+window_should_close :: proc(window: ^Window) -> bool {
 	if window.handle == nil do return true
 	return bool(glfw.WindowShouldClose(window.handle))
 }
 
-window_framebuffer_size :: proc(window: Window) -> (u32, u32) {
+window_framebuffer_size :: proc(window: ^Window) -> (u32, u32) {
 	if window.handle == nil do return 0, 0
 
 	width, height := glfw.GetFramebufferSize(window.handle)
@@ -63,4 +91,37 @@ window_required_extensions :: proc() -> ([]cstring, Error) {
 	if extensions == nil do return nil, GLFW_Error{message = "Failed to get required GLFW extensions"}
 
 	return extensions, nil
+}
+
+window_get_events :: proc(window: ^Window) {
+	if window.handle == nil do return
+	glfw.PollEvents()
+}
+
+window_clear_events :: proc(window: ^Window) {
+	if window.handle == nil do return
+	clear(&window.events)
+}
+
+// >------------------------------------------------------------------ Internals
+
+@(private = "file")
+on_framebuffer_size :: proc "c" (handle: glfw.WindowHandle, width, height: i32) {
+	context = runtime.default_context()
+	w := cast(^Window)glfw.GetWindowUserPointer(handle)
+	append(&w.events, Window_Event_Resize{u32(width), u32(height)})
+}
+
+@(private = "file")
+on_key :: proc "c" (handle: glfw.WindowHandle, key, scancode, action, mods: i32) {
+	context = runtime.default_context()
+	w := cast(^Window)glfw.GetWindowUserPointer(handle)
+	append(&w.events, Window_Event_Key{key, action, mods})
+}
+
+@(private = "file")
+on_window_close :: proc "c" (handle: glfw.WindowHandle) {
+	context = runtime.default_context()
+	w := cast(^Window)glfw.GetWindowUserPointer(handle)
+	append(&w.events, Window_Event_Close{})
 }
