@@ -1498,7 +1498,13 @@ record_command_buffer :: proc(
 	)
 
 	// Start rendering
-	begin_rendering(command_buffer, image_view, color_image_view, depth_image_view, swap_chain_extent)
+	begin_rendering(
+		command_buffer,
+		image_view,
+		color_image_view,
+		depth_image_view,
+		swap_chain_extent,
+	)
 
 	// We can now bind the graphics pipeline
 	vk.CmdBindPipeline(command_buffer, .GRAPHICS, graphics_pipeline)
