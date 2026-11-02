@@ -2,7 +2,13 @@ package ovk
 
 import vk "vendor:vulkan"
 
+// >-------------------------------------------------------- Constants and Types
+
 Instance :: struct {
-	instance:        vk.Instance,
-	debug_messenger: vk.DebugUtilsMessengerEXT,
+	handle:                vk.Instance,
+	debug_messenger:       vk.DebugUtilsMessengerEXT,
+	api_version:           u32,
+	is_validation_enabled: bool,
+	extensions:            []string,
+	layers:                []string,
 }
