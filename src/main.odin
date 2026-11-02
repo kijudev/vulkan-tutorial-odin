@@ -492,15 +492,21 @@ transition_image_layout :: proc(
 begin_rendering :: proc(
 	command_buffer: vk.CommandBuffer,
 	image_view: vk.ImageView,
+	color_image_view: vk.ImageView,
 	depth_image_view: vk.ImageView,
 	swap_chain_extent: vk.Extent2D,
 ) {
+	// Render into the multisampled color image, then resolve
+	// (average the samples) into the single-sampled swap chain image.
 	color_attachment_i := vk.RenderingAttachmentInfo {
 		sType = .RENDERING_ATTACHMENT_INFO,
-		imageView = image_view,
+		imageView = color_image_view,
 		imageLayout = .COLOR_ATTACHMENT_OPTIMAL,
+		resolveMode = {.AVERAGE},
+		resolveImageView = image_view,
+		resolveImageLayout = .COLOR_ATTACHMENT_OPTIMAL,
 		loadOp = .CLEAR,
-		storeOp = .STORE,
+		storeOp = .DONT_CARE,
 		clearValue = {color = {float32 = {0.0, 0.0, 0.0, 1.0}}},
 	}
 
@@ -800,6 +806,7 @@ create_depth_resources :: proc(
 	physical_device: vk.PhysicalDevice,
 	depth_format: vk.Format,
 	swap_chain_extent: vk.Extent2D,
+	samples: vk.SampleCountFlags,
 ) -> (
 	vk.Image,
 	vk.DeviceMemory,
@@ -812,6 +819,7 @@ create_depth_resources :: proc(
 		swap_chain_extent.width,
 		swap_chain_extent.height,
 		1,
+		samples,
 		depth_format,
 		{.DEPTH_STENCIL_ATTACHMENT},
 		{.DEVICE_LOCAL},
@@ -881,6 +889,63 @@ load_model :: proc(path: string) -> (vertices: []Vertex, indices: []u16) {
 
 count_mip_levels :: proc(width: u32, height: u32) -> u32 {
 	return u32(math.floor(math.log2(f32(max(width, height))))) + 1
+}
+
+get_max_usable_sample_count :: proc(physical_device: vk.PhysicalDevice) -> vk.SampleCountFlags {
+	props: vk.PhysicalDeviceProperties
+	vk.GetPhysicalDeviceProperties(physical_device, &props)
+
+	counts := props.limits.framebufferColorSampleCounts & props.limits.framebufferDepthSampleCounts
+
+	if (counts & {._64}) == {._64} {return {._64}}
+	if (counts & {._32}) == {._32} {return {._32}}
+	if (counts & {._16}) == {._16} {return {._16}}
+	if (counts & {._8}) == {._8} {return {._8}}
+	if (counts & {._4}) == {._4} {return {._4}}
+	if (counts & {._2}) == {._2} {return {._2}}
+
+	return {._1}
+}
+
+create_color_resources :: proc(
+	logical_device: vk.Device,
+	physical_device: vk.PhysicalDevice,
+	color_format: vk.Format,
+	swap_chain_extent: vk.Extent2D,
+	samples: vk.SampleCountFlags,
+) -> (
+	vk.Image,
+	vk.DeviceMemory,
+	vk.ImageView,
+) {
+
+	color_image, color_image_memory := create_image(
+		logical_device,
+		physical_device,
+		swap_chain_extent.width,
+		swap_chain_extent.height,
+		1,
+		samples,
+		color_format,
+		{.TRANSIENT_ATTACHMENT, .COLOR_ATTACHMENT},
+		{.DEVICE_LOCAL},
+	)
+
+	color_image_view := create_image_view(logical_device, color_image, color_format, {.COLOR}, 1)
+
+	return color_image, color_image_memory, color_image_view
+}
+
+
+destroy_color_resources :: proc(
+	logical_device: vk.Device,
+	color_image: vk.Image,
+	color_image_memory: vk.DeviceMemory,
+	color_image_view: vk.ImageView,
+) {
+	vk.DestroyImageView(logical_device, color_image_view, nil)
+	vk.FreeMemory(logical_device, color_image_memory, nil)
+	vk.DestroyImage(logical_device, color_image, nil)
 }
 
 // >--------------------------------------------------------------- VULKAN SETUP
@@ -1185,6 +1250,7 @@ create_graphics_pipeline :: proc(
 	swap_chain_format: vk.Format,
 	descriptor_set_layout: vk.DescriptorSetLayout,
 	depth_format: vk.Format,
+	samples: vk.SampleCountFlags,
 ) -> (
 	vk.Pipeline,
 	vk.PipelineLayout,
@@ -1278,7 +1344,7 @@ create_graphics_pipeline :: proc(
 	multisampling_ci := vk.PipelineMultisampleStateCreateInfo {
 		sType                 = .PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
 		sampleShadingEnable   = false,
-		rasterizationSamples  = {._1},
+		rasterizationSamples  = samples,
 		minSampleShading      = 1,
 		pSampleMask           = nil,
 		alphaToCoverageEnable = false,
@@ -1384,6 +1450,8 @@ record_command_buffer :: proc(
 	descriptor_set: vk.DescriptorSet,
 	depth_image: vk.Image,
 	depth_image_view: vk.ImageView,
+	color_image: vk.Image,
+	color_image_view: vk.ImageView,
 ) {
 
 	// Begin to start the recording...
@@ -1393,6 +1461,19 @@ record_command_buffer :: proc(
 	transition_image_layout(
 		command_buffer,
 		image,
+		.UNDEFINED,
+		.COLOR_ATTACHMENT_OPTIMAL,
+		{}, // srcAccessMask
+		{.COLOR_ATTACHMENT_WRITE}, // dstAccessMask
+		{.COLOR_ATTACHMENT_OUTPUT}, // srcStage
+		{.COLOR_ATTACHMENT_OUTPUT}, // dstStage
+		{.COLOR},
+		1,
+	)
+
+	transition_image_layout(
+		command_buffer,
+		color_image,
 		.UNDEFINED,
 		.COLOR_ATTACHMENT_OPTIMAL,
 		{}, // srcAccessMask
@@ -1417,7 +1498,7 @@ record_command_buffer :: proc(
 	)
 
 	// Start rendering
-	begin_rendering(command_buffer, image_view, depth_image_view, swap_chain_extent)
+	begin_rendering(command_buffer, image_view, color_image_view, depth_image_view, swap_chain_extent)
 
 	// We can now bind the graphics pipeline
 	vk.CmdBindPipeline(command_buffer, .GRAPHICS, graphics_pipeline)
@@ -1811,6 +1892,7 @@ create_image :: proc(
 	width: u32,
 	height: u32,
 	mip_levels_count: u32,
+	samples: vk.SampleCountFlags,
 	format: vk.Format,
 	usage: vk.ImageUsageFlags,
 	properties: vk.MemoryPropertyFlags,
@@ -1829,7 +1911,7 @@ create_image :: proc(
 		initialLayout = .UNDEFINED,
 		usage = usage,
 		sharingMode = .EXCLUSIVE,
-		samples = {._1},
+		samples = samples,
 	}
 
 	image: vk.Image
@@ -1907,6 +1989,7 @@ create_image_texture :: proc(
 		width,
 		height,
 		mip_level_count,
+		{._1},
 		.R8G8B8A8_SRGB,
 		{.TRANSFER_DST, .SAMPLED},
 		{.DEVICE_LOCAL},
@@ -2250,17 +2333,32 @@ main :: proc() {
 	depth_format := find_depth_format(physical_device)
 	fmt.println("Vulkan depth format found")
 
+	samples := get_max_usable_sample_count(physical_device)
+
 	depth_image, depth_memory, depth_image_view := create_depth_resources(
 		logical_device,
 		physical_device,
 		depth_format,
 		swap_chain_extent,
+		samples,
 	)
+
 	defer vk.FreeMemory(logical_device, depth_memory, nil)
 	defer vk.DestroyImage(logical_device, depth_image, nil)
 	defer vk.DestroyImageView(logical_device, depth_image_view, nil)
 
 	fmt.println("Vulkan depth resources acquired")
+
+	color_image, color_memory, color_image_view := create_color_resources(
+		logical_device,
+		physical_device,
+		swap_chain_format,
+		swap_chain_extent,
+		samples,
+	)
+	defer destroy_color_resources(logical_device, color_image, color_memory, color_image_view)
+
+	fmt.println("Vulkan color resources acquired")
 
 	graphics_pipeline, pipeline_layout := create_graphics_pipeline(
 		logical_device,
@@ -2270,6 +2368,7 @@ main :: proc() {
 		swap_chain_format,
 		ubo_descriptor_set_layout,
 		depth_format,
+		samples,
 	)
 	defer vk.DestroyPipelineLayout(logical_device, pipeline_layout, nil)
 	defer vk.DestroyPipeline(logical_device, graphics_pipeline, nil)
@@ -2462,6 +2561,8 @@ main :: proc() {
 				descriptor_sets[frame_index],
 				depth_image,
 				depth_image_view,
+				color_image,
+				color_image_view,
 			)
 
 			submit_command_buffer(
@@ -2522,6 +2623,16 @@ main :: proc() {
 				physical_device,
 				depth_format,
 				swap_chain_extent,
+				samples,
+			)
+
+			destroy_color_resources(logical_device, color_image, color_memory, color_image_view)
+			color_image, color_memory, color_image_view = create_color_resources(
+				logical_device,
+				physical_device,
+				swap_chain_format,
+				swap_chain_extent,
+				samples,
 			)
 
 			for semaphore in submit_semaphores {
